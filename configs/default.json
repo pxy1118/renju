@@ -1,0 +1,17 @@
+{
+  "channels": 64,
+  "blocks": 6,
+  "simulations": 200,
+  "cpuct": 2.0,
+  "temperature_moves": 20,
+  "workers": 16,
+  "games_per_round": 32,
+  "train_steps": 200,
+  "replay_capacity": 100000,
+  "batch_size": 256,
+  "learning_rate": 0.001,
+  "weight_decay": 0.0001,
+  "seed": 20260910,
+  "eval_every": 10,
+  "eval_pairs": 10
+}

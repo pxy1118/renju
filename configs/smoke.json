@@ -1,0 +1,10 @@
+{
+  "channels": 16,
+  "blocks": 1,
+  "simulations": 4,
+  "workers": 2,
+  "games_per_round": 2,
+  "train_steps": 2,
+  "batch_size": 8,
+  "replay_capacity": 1000
+}

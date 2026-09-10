@@ -1,0 +1,22 @@
+# Normalize line endings for text files; keep Windows scripts CRLF-friendly.
+* text=auto
+
+*.py   text eol=lf
+*.json text eol=lf
+*.toml text eol=lf
+*.md   text eol=lf
+*.yml  text eol=lf
+*.yaml text eol=lf
+*.js   text eol=lf
+*.css  text eol=lf
+*.html text eol=lf
+
+*.bat  text eol=crlf
+*.ps1  text eol=crlf
+*.cmd  text eol=crlf
+
+*.pt   binary
+*.pth  binary
+*.png  binary
+*.jpg  binary
+*.ico  binary
