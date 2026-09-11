@@ -23,7 +23,86 @@ Double-clicking again detects that the port is already in use and simply opens t
 
 The interface supports choosing the rule and your color, manually selecting the latest / historical best / several most recent checkpoints, 32/64/200 MCTS searches, a move counter, undoing the last round, restarting, and an end-of-game notice; at the end of a game the winning five stones are highlighted and the dot on the left of the status line becomes the winning side's piece (hidden on a draw), so "who won" is stated consistently in three places: text, piece, and line. The model drop-down lists the most recently written checkpoints for that rule (name, time, size), letting you revisit early training weights; if the selected file is removed by checkpoint rotation, it automatically falls back to "latest". Renju legality reuses the training rules; when no checkpoint exists, random weights are not passed off as a trained model — "Start Game" becomes "No model available" together with the reason.
 
-The Web UI always uses **CPU with a single inference thread**: it neither requests CUDA nor the training GPU lock, and it does not write to the training directory. It still consumes CPU and memory — a single service process has been measured at roughly a 550 MB resident working set and about 1.5 GB of private memory (including the CUDA-enabled PyTorch runtime), so running it alongside training causes memory contention. A new game loads the model saved at that moment, and the weights stay fixed for the whole game. Clicking "Restart" picks up an updated checkpoint. The service listens on localhost only, all browser tabs share a single board, and refreshing restores the current game; the game is not preserved after the service exits. While the model is thinking, wait for the move to finish before undoing or restarting. The client polls status every 250 ms while the model is thinking and every 1 second when idle, so even thinking times of a few hundred milliseconds show as "model thinking". When you run `python main.py webui` directly, the log is printed to the terminal. A model being trained does not mean mature playing strength already exists.
+The Web UI always uses **CPU with a single inference thread**: it neither requests CUDA nor the training GPU lock, and it does not write to the training directory. It still consumes CPU and memory — a single service process has been measured at roughly a 550 MB resident working set and about 1.5 GB of private memory (including the CUDA-enabled PyTorch runtime), so running it alongside training causes memory contention. A new game loads the model saved at that moment, and the weights stay fixed for the whole game. Clicking "Restart" picks up an updated checkpoint. The service listens on localhost only by default, all browser tabs share a single board, and refreshing restores the current game; the game is not preserved after the service exits. While the model is thinking, wait for the move to finish before undoing or restarting. The client polls status every 250 ms while the model is thinking and every 1 second when idle, so even thinking times of a few hundred milliseconds show as "model thinking". When you run `python main.py webui` directly, the log is printed to the terminal. A model being trained does not mean mature playing strength already exists.
+
+### Sharing it with friends for a while (10 tables by default)
+
+Sharing is off by default. Add `--share` and `--host <LAN-IP>` and the service prints an **invite link** that a friend on the same network can simply open. For a quick share, double-click `share-webui.bat` (the same as `start-webui.ps1 -Share`, which picks the default-route LAN address itself), or run it by hand:
+
+```powershell
+# find this machine's LAN address, then pass it to --host
+Get-NetIPAddress -AddressFamily IPv4 | Where-Object AddressState -eq Preferred
+.\.venv\Scripts\python.exe main.py webui --host 192.168.1.3 --share
+# optional: require a password in addition to the link
+.\.venv\Scripts\python.exe main.py webui --host 192.168.1.3 --share --password <password>
+# or bind every interface; the invite link then picks the default-route address
+.\.venv\Scripts\python.exe main.py webui --host 0.0.0.0 --share --max-sessions 10
+```
+
+Startup prints something like:
+
+```text
+Renju Web UI: http://127.0.0.1:8765 (CPU inference; training continues)
+分享链接（最多 10 桌）: http://192.168.1.3:8765/?k=<random string>
+```
+
+What sharing does and does not do:
+
+- **One private table per player.** A browser that opens the invite link receives a session cookie and its own game; the page grows an "Invite a friend" panel with the current table count and a copyable link.
+- **The link stays in the address bar only once.** The server exchanges `?k=` for a cookie and redirects to a clean `/`, so refreshes and back-navigation never carry the credential; the cookie is `HttpOnly` and `SameSite=Strict`.
+- **Ten tables at most by default** (`--max-sessions`, 1–16). Capacity is a resource limit, not a queue: every table holds its own network and search tree, so an eleventh visitor gets a 429 "share is full" page instead of displacing somebody's game. "End my table" in the page releases the slot. Memory is not the bottleneck — measured at roughly 16–30 MB per table (the network weights are only about 2 MB; the search tree dominates), so ten tables cost a few hundred MB. **CPU is what runs out first**: each table searches independently, so the more people think at once, the longer each of them waits.
+- **Temporary by construction.** The invite string and every table live in memory only and die with the service; after Ctrl+C the guests' next poll simply fails.
+- **Trusted networks only.** The link is a ticket: whoever holds it can spend your CPU and memory (each table adds a network and a search tree, so memory grows with the table count). LAN sharing is fine; to expose this to the internet use `--public` below, which brings its own password.
+- With `--share` but the default host, the service still listens on 127.0.0.1 only; startup says so and suggests the `--host` value to use. With `--host` set to a LAN address but no `--share`, the service is a single table with **no credentials**, which is only appropriate on a network you trust.
+
+### Exposing it to the internet in one command (`--public`)
+
+Adding `--public` is the whole ceremony: the service turns sharing on, binds every interface, starts a Cloudflare quick tunnel (cloudflared must be installed), waits until the tunnel is actually registered, and then prints the public link and password together.
+
+```powershell
+.\.venv\Scripts\python.exe main.py webui --public
+```
+
+The output looks like:
+
+```text
+Renju Web UI: http://127.0.0.1:8765 (CPU inference; training continues)
+分享链接（最多 10 桌，进入时需输入口令）: http://192.168.1.3:8765/?k=<random>
+正在为公网访问启动 Cloudflare 隧道（cloudflared 需能连上外网）……
+
+公网访问口令: <random password>
+公网邀请链接: https://<random-name>.trycloudflare.com/?k=<random>
+```
+
+Send the recipient **the link and the password together**. Details:
+
+- **The password is generated for you.** Going public hands the board to strangers, so `--public` never opens a passwordless share; pass `--password <password>` to choose your own. The password only gates entry (typed once, then exchanged for a cookie) while the invite string is itself a ticket — either one gets in, so give both only to people you mean to.
+- **One service, two kinds of guest.** A tunnel guest is handed `https://<tunnel host>/?k=…` (built from the request's `Host` and `X-Forwarded-Proto`), while a LAN guest still sees the `http://192.168.1.3:8765/?k=…` printed at startup. No `--trusted-host` is needed: `--public` admits only the hostname this run's tunnel was actually given.
+- **If the tunnel cannot start, the whole command exits** rather than leaving a service you believe is public when it is not. The wait defaults to 40 seconds; use `--tunnel-timeout` to change it.
+- **The hostname changes on every restart**, and quick tunnels carry no uptime guarantee. Cloudflare itself warns that a new hostname "may take some time to be reachable" (about 20 seconds of DNS propagation in testing here). If cloudflared is not on PATH, pass `--cloudflared <path>` or run `winget install --id Cloudflare.cloudflared`.
+- **Ctrl+C takes the tunnel down with it**, so the public link stops working immediately. The tunnel process is owned by the service; no second window is needed.
+- `--public` cannot be combined with a specific interface address (cloudflared always dials `127.0.0.1`) and says so instead of failing obscurely; for another bind address use the manual route below.
+- **`--max-sessions` sets how many tables run at once** (10 by default, 16 maximum). Each holds its own network and search tree at roughly 16–30 MB, so memory is not the issue; CPU is, because ten concurrent searches slow every one of them down. Lower it when the machine struggles.
+
+### Sharing through a Cloudflare tunnel (manual)
+
+When you need your own domain, a reverse proxy, or a named tunnel, the pieces still combine by hand. The Host fence accepts loopback, this machine's addresses, and exactly the names you pass, so DNS-rebinding style attacks stay outside.
+
+```powershell
+# 1) the service must be reachable by the tunnel: cloudflared dials 127.0.0.1:8765, so bind every interface
+.\.venv\Scripts\python.exe main.py webui --host 0.0.0.0 --share --password <password> `
+    --trusted-host .trycloudflare.com
+# 2) start the tunnel in another window; the script prints this run's public URL
+.\scripts\tunnel-webui.ps1
+```
+
+Details:
+
+- **`--trusted-host` takes two forms**: a full name (`board.example.com`) admits just that host, both bare and with this port because the proxy decides the port; a leading dot (`.trycloudflare.com`) admits the whole subdomain tree, which suits a quick tunnel whose hostname changes on every restart.
+- **Tunnel guests get a public invite link**: the "Invite a friend" panel shows `https://<host you are visiting>/?k=…`, derived from the request's `Host` and `X-Forwarded-Proto`, while LAN visitors still see the address printed at startup.
+- **A quick tunnel's hostname is random** and changes when cloudflared restarts; `scripts/tunnel-webui.ps1` prints the new one. The tunnel itself has **no authentication at all**, so always pair it with `--password`.
+- Before starting the tunnel, make sure port 8765 serves the **shared** instance: if an older loopback-only service without `--share` holds the port, the tunnel reaches that one and guests see "Local access only" or a single unauthenticated table.
+
 
 ### Stopping the service
 
