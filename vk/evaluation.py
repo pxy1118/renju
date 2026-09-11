@@ -441,9 +441,10 @@ def evaluate_rapfi(model, cfg, device, engine, engine_dir, pairs,
                                  for record in results]
         return report
 
-    with RapfiClient(engine, engine_dir, threads, hash_mb, max_nodes, timeout, 2, rule="freestyle") as rapfi:
+    rule = cfg.get("rule", "freestyle")
+    with RapfiClient(engine, engine_dir, threads, hash_mb, max_nodes, timeout, 2, rule=rule) as rapfi:
         for pair in range(pairs):
-            start = opening("freestyle", opening_seed + pair, mode, cfg.get("opening_plies", 8),
+            start = opening(rule, opening_seed + pair, mode, cfg.get("opening_plies", 8),
                             rapfi, book=book)
             for color in (1, -1):
                 if stopped():

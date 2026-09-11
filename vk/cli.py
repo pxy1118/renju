@@ -305,8 +305,8 @@ def main():
             if args.command == "evaluate":
                 from .evaluation import evaluate_suite, evaluate_rapfi
                 if args.opponent == "rapfi":
-                    if not args.engine or not args.engine_dir or args.rule != "freestyle":
-                        p.error("Rapfi evaluation requires --rule freestyle, --engine and --engine-dir")
+                    if not args.engine or not args.engine_dir:
+                        p.error("Rapfi evaluation requires --engine and --engine-dir")
                     report = {"rapfi": evaluate_rapfi(model, cfg, args.device, args.engine,
                               args.engine_dir, args.pairs, time.monotonic()+args.minutes*60,
                               lambda: stopping[0], args.engine_threads, args.engine_hash_mb,
