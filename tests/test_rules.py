@@ -1,6 +1,6 @@
 import numpy as np
 import pytest
-from az.game import Game, forbidden, fours, DIRECTIONS
+from vk.game import Game, forbidden, fours, DIRECTIONS
 
 
 def position(black=(), white=(), rule="renju", player=1):

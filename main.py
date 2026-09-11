@@ -1,4 +1,4 @@
-from az.cli import main
+from vk.cli import main
 
 
 if __name__ == "__main__":

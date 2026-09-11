@@ -3,10 +3,10 @@ import time
 import numpy as np
 import pytest
 import torch
-from az.game import Game
-from az.network import Network, Evaluator
-from az.training import DEFAULTS, train, load_checkpoint, checkpoint_path
-from az.selfplay import collect
+from vk.game import Game
+from vk.network import Network, Evaluator
+from vk.training import DEFAULTS, train, load_checkpoint, checkpoint_path
+from vk.selfplay import collect
 
 
 @pytest.mark.parametrize("rule", ["freestyle","renju"])
@@ -28,7 +28,7 @@ def test_train_and_resume(tmp_path,rule):
 
 
 def test_resume_allows_worker_count_change(tmp_path,monkeypatch):
-    import az.training as module
+    import vk.training as module
     cfg = dict(DEFAULTS,channels=4,blocks=1,simulations=1,workers=1,
                games_per_round=1,train_steps=1,batch_size=2,replay_capacity=300)
     data = [(Game().encode(),np.full(225,1/225),1.0)]
@@ -57,7 +57,7 @@ def test_worker_error_is_propagated():
 
 
 def test_resume_finishes_pending_updates_before_new_games(tmp_path,monkeypatch):
-    import az.training as module
+    import vk.training as module
     cfg = dict(DEFAULTS,channels=4,blocks=1,train_steps=3,batch_size=2)
     data = [(Game().encode(),np.full(225,1/225),1.0)]
     monkeypatch.setattr(module,"collect",lambda *args: (data,[{"winner":1,"moves":[],"simulations":1}],

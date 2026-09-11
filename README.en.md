@@ -1,4 +1,4 @@
-# Dual-Rule Gomoku / Renju AlphaZero
+# Visk — Dual-Rule Gomoku / Renju
 
 English | [简体中文](README.md)
 
@@ -42,7 +42,7 @@ Get-NetIPAddress -AddressFamily IPv4 | Where-Object AddressState -eq Preferred
 Startup prints something like:
 
 ```text
-Renju Web UI: http://127.0.0.1:8765 (CPU inference; training continues)
+Visk Web UI: http://127.0.0.1:8765 (CPU inference; training continues)
 分享链接（最多 10 桌）: http://192.168.1.3:8765/?k=<random string>
 ```
 
@@ -66,7 +66,7 @@ Adding `--public` is the whole ceremony: the service turns sharing on, binds eve
 The output looks like:
 
 ```text
-Renju Web UI: http://127.0.0.1:8765 (CPU inference; training continues)
+Visk Web UI: http://127.0.0.1:8765 (CPU inference; training continues)
 分享链接（最多 10 桌，进入时需输入口令）: http://192.168.1.3:8765/?k=<random>
 正在为公网访问启动 Cloudflare 隧道（cloudflared 需能连上外网）……
 
@@ -219,6 +219,6 @@ python main.py train --rule renju --config configs/smoke.json --output artifacts
 
 Tests cover wins in all four directions, overlines, real and false double-threes, same-direction and crossing double-fours, edges and a full board, legal actions, the sign of search backup, immediate wins and necessary defenses, augmentation alignment, full-game labels, actual parameter updates, checkpoint resumption, stopping, rule isolation, and worker exception propagation.
 
-The implementation is layered: `main.py` is the unified command entry point; `az/game.py` holds the rules; `az/search.py` is MCTS; `az/selfplay.py` is multi-process sampling; `az/network.py` is the network and inference; `az/training.py` covers optimization and resumption; `az/evaluation.py` is head-to-head evaluation; `az/cli.py` handles command parsing.
+The implementation is layered: `main.py` is the unified command entry point; `vk/game.py` holds the rules; `vk/search.py` is MCTS; `vk/selfplay.py` is multi-process sampling; `vk/network.py` is the network and inference; `vk/training.py` covers optimization and resumption; `vk/evaluation.py` is head-to-head evaluation; `vk/cli.py` handles command parsing.
 
 Method references: [AlphaGo Zero](https://deepmind.google/blog/alphago-zero-starting-from-scratch/), [DeepMind OpenSpiel AlphaZero](https://github.com/google-deepmind/open_spiel/blob/master/docs/alpha_zero.md), [PyTorch CUDA installation](https://pytorch.org/get-started/previous-versions/). This project is a simplified AlphaZero system for Gomoku, not a reproduction of the original paper's compute scale or a complete implementation.

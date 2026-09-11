@@ -67,7 +67,7 @@ def display(g):
 
 
 def main():
-    p = argparse.ArgumentParser(description="Dual-rule AlphaZero")
+    p = argparse.ArgumentParser(description="Visk — dual-rule Gomoku/Renju self-play training")
     p.add_argument("command", choices=["doctor", "teacher-generate", "pretrain", "train", "benchmark", "evaluate", "play", "webui"])
     p.add_argument("--port", type=int, default=8765, help="local Web UI port")
     p.add_argument("--no-browser", action="store_true", help="do not open the Web UI automatically")

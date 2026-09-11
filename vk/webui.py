@@ -170,7 +170,7 @@ def start_tunnel(server, port, executable=None, timeout=40.0):
 
     The hostname is known only after cloudflared reports it, so the tunnel state
     is published while the server is already serving. That is safe: the name was
-    validated by :mod:`az.tunnel`, and a request arriving before it exists is
+    validated by :mod:`vk.tunnel`, and a request arriving before it exists is
     simply the 403 it would have received anyway.
 
     The name is deliberately *not* added to the fence. The fence holds the names
@@ -596,7 +596,7 @@ def make_server(port=8765, root=ROOT / "runs", host="127.0.0.1", share=False,
 
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
-        server_version = "RenjuWebUI"
+        server_version = "ViskWebUI"
 
         # --- plumbing -----------------------------------------------------
         def send(self, status, body, kind="application/json; charset=utf-8", headers=()):
@@ -863,7 +863,7 @@ def serve(port=8765, root=ROOT / "runs", open_browser=True, host="127.0.0.1", sh
     server = make_server(port, root, host=host, share=share, max_sessions=max_sessions,
                          password=password, trusted_hosts=trusted_hosts)
     url = f"http://127.0.0.1:{server.server_port}"
-    print(f"Renju Web UI: {url} (CPU inference; training continues)", flush=True)
+    print(f"Visk Web UI: {url} (CPU inference; training continues)", flush=True)
     if share:
         link = server.invite(server.server_port)
         if link is None:

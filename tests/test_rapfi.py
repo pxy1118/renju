@@ -3,8 +3,8 @@ import textwrap
 import os
 import pytest
 
-from az.game import Game
-from az.rapfi import RapfiClient, RapfiError, board_command
+from vk.game import Game
+from vk.rapfi import RapfiClient, RapfiError, board_command
 
 
 def fake_engine(path, mode="ok"):

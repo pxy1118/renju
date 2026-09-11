@@ -10,11 +10,11 @@ import numpy as np
 import pytest
 import torch
 
-from az.game import Game, lengths
-from az.network import Network
-from az.training import DEFAULTS, atomic_save
-from az.tunnel import hostname_ok, link_hostname, parse_log_line
-from az.webui import (LAN_SESSION_LIMIT, Sessions, Table, get_local_ipv4, make_server,
+from vk.game import Game, lengths
+from vk.network import Network
+from vk.training import DEFAULTS, atomic_save
+from vk.tunnel import hostname_ok, link_hostname, parse_log_line
+from vk.webui import (LAN_SESSION_LIMIT, Sessions, Table, get_local_ipv4, make_server,
                       proxy_patterns, serve, start_tunnel, trusted_host_match)
 
 
@@ -619,7 +619,7 @@ def test_start_tunnel_publishes_the_hostname_but_never_the_fence(monkeypatch):
     A tunnel name in the fence would make every guest look like a LAN visitor and
     hand them the operator's LAN link instead of the public one.
     """
-    monkeypatch.setattr("az.webui.Tunnel", lambda *a, **k: FakeTunnel())
+    monkeypatch.setattr("vk.webui.Tunnel", lambda *a, **k: FakeTunnel())
     server = type("S", (), {"fence": {"127.0.0.1:8765", "192.0.2.5:8765"},
                             "tunnel_lock": threading.Lock(), "tunnel": None,
                             "tunnel_host": None})()
@@ -653,14 +653,14 @@ def test_serve_closes_the_tunnel_when_the_operator_stops_it(monkeypatch):
     """Ctrl+C must take the public route down with it, never leave it open."""
     server = FakeServer()
     tunnel = type("K", (), {"stop": lambda self: setattr(server, "stopped", True)})()
-    monkeypatch.setattr("az.webui.make_server", lambda *a, **k: server)
+    monkeypatch.setattr("vk.webui.make_server", lambda *a, **k: server)
 
     def fake_start(server_, port, executable=None, timeout=40.0):
         server_.tunnel = tunnel
         server_.tunnel_host = BANNER_HOST
         return f"https://{BANNER_HOST}"
 
-    monkeypatch.setattr("az.webui.start_tunnel", fake_start)
+    monkeypatch.setattr("vk.webui.start_tunnel", fake_start)
     serve(8765, "runs", open_browser=False, public=True)
 
     assert server.stopped, "the tunnel outlived the server"

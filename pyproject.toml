@@ -1,7 +1,7 @@
 [project]
 name = "renju"
 version = "0.1.0"
-description = "Dual-rule AlphaZero self-play training"
+description = "Visk — dual-rule Gomoku/Renju AlphaZero self-play training"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [

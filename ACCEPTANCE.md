@@ -168,7 +168,7 @@ Rapfi 随后以 `external/rapfi` Git 子模块加入，固定提交 `3c94c2a976f
 
 需求：`python main.py webui` 增加一个可选参数，决定是否暴露公网，是则给出可分享的链接。此前公网只能靠“一个窗口跑服务 + 另一个窗口跑 `scripts/tunnel-webui.ps1` + 手写 `--trusted-host .trycloudflare.com`”三步拼出来，且第一步必须先知道域名——而 quick tunnel 的域名每次重启都变。
 
-新增 `az/tunnel.py`（托管 cloudflared 子进程）与 `--public` 参数：
+新增 `vk/tunnel.py`（托管 cloudflared 子进程）与 `--public` 参数：
 
 - **域名是发现出来的，不是配置出来的**。cloudflared 每次启动向 Cloudflare 申请一个随机域名，只能从它的日志里读。`Tunnel.start()` 同时等两件事：日志里出现 `https://<name>.trycloudflare.com`，以及 `Registered tunnel connection`（后者才是边缘真正可用的标志，前者只是“已创建”）。
 - **日志是不可信输入**。第一版用 `https://[A-Za-z0-9.-]+` 抓“第一个 https 链接”，结果抓到的是 cloudflared 启动横幅里的**服务条款链接** `https://www.cloudflare.com/website-terms/`，于是公网链接变成了 `https://www.cloudflare.com`（实测复现）。现在正则锚定 `.trycloudflare.com` 后缀，再经 `hostname_ok()` 按 RFC 1123 校验，`[::1]`、`host:port`、空格、超长名一律拒绝——这些字符串会进入 Host 白名单并被打进给访客的链接，所以宁可拒绝也不能放行。
@@ -185,7 +185,7 @@ Rapfi 随后以 `external/rapfi` Git 子模块加入，固定提交 `3c94c2a976f
 
 验证：`tests/test_webui.py` 由 16 项增至 **21 项**（新增横幅解析、主机名校验、`proxy_patterns`、`start_tunnel` 不污染 fence、`serve` 退出时必关隧道），全量 **85 passed, 1 skipped**。
 
-另有两份一次性端到端脚本（`artifacts/verification/public-tunnel.py` 直接验证 `az.tunnel`，`artifacts/verification/public-tunnel-e2e.py` 打真实 `--public` 服务）：真实 cloudflared 在 ~5 秒内给出域名，公网 GET 取回探针内容，`Tunnel.stop()` 幂等且进程确实退出；`--public` 服务上 15 项断言全过——隧道域名入站返回口令页、错误口令 400、正确口令换到 `renju_session`、面板给出 `https://<隧道域名>/?k=…`（而非局域网链接）、隧道访客能读到自己那张棋桌并开新局、第 4 位访客收到 429、局域网访客仍拿局域网链接、`evil.example.test` 等外部域名一律 403。
+另有两份一次性端到端脚本（`artifacts/verification/public-tunnel.py` 直接验证 `vk.tunnel`，`artifacts/verification/public-tunnel-e2e.py` 打真实 `--public` 服务）：真实 cloudflared 在 ~5 秒内给出域名，公网 GET 取回探针内容，`Tunnel.stop()` 幂等且进程确实退出；`--public` 服务上 15 项断言全过——隧道域名入站返回口令页、错误口令 400、正确口令换到 `renju_session`、面板给出 `https://<隧道域名>/?k=…`（而非局域网链接）、隧道访客能读到自己那张棋桌并开新局、第 4 位访客收到 429、局域网访客仍拿局域网链接、`evil.example.test` 等外部域名一律 403。
 
 未验证：**从另一台真实设备/手机**打开公网链接点击落子（本机只能验到边缘回源这一侧）；`--public` 在 Windows 之外的平台未实测。
 
@@ -193,9 +193,9 @@ Rapfi 随后以 `external/rapfi` Git 子模块加入，固定提交 `3c94c2a976f
 
 用户反馈“并发有点少”，把默认桌数从 3 提到 10。改动集中在三处常量与其派生文案：
 
-- `az/webui.py` 的 `LAN_SESSION_LIMIT` 3 → **10**（`Sessions`、`make_server`、`serve` 的默认值都由它派生）。
-- `az/cli.py` 的 `--max-sessions` 默认值 3 → **10**，上限仍为 16：那是防手滑写出天文数字的护栏，不是对机器能力的断言。（帮助文本里的单桌成本先写成“每桌约 200 MB”，实测后已改为“tens of MB、先撑不住的是 CPU”，见下文。）
-- `az/web/index.html` 的占位文案 `0 / 3 桌` → `0 / 0 桌`。页面上真正的桌数与上限都由 `/api/config` 的 `max_sessions` / `sessions` 填充（`app.js`），占位值只在首帧可见，写死 3 会在下一次调整时再次变成谎言。
+- `vk/webui.py` 的 `LAN_SESSION_LIMIT` 3 → **10**（`Sessions`、`make_server`、`serve` 的默认值都由它派生）。
+- `vk/cli.py` 的 `--max-sessions` 默认值 3 → **10**，上限仍为 16：那是防手滑写出天文数字的护栏，不是对机器能力的断言。（帮助文本里的单桌成本先写成“每桌约 200 MB”，实测后已改为“tens of MB、先撑不住的是 CPU”，见下文。）
+- `vk/web/index.html` 的占位文案 `0 / 3 桌` → `0 / 0 桌`。页面上真正的桌数与上限都由 `/api/config` 的 `max_sessions` / `sessions` 填充（`app.js`），占位值只在首帧可见，写死 3 会在下一次调整时再次变成谎言。
 
 **代价要说清楚（这里原先写错了）**：我最初按“每桌约 200 MB、10 桌约 2 GB”改的文案，那是拿“一个完整的 Web UI 进程占用（约 540 MB 工作集）”当成了单桌成本，属于凭空估算。实际用 `artifacts/verification/table-memory.py` 逐桌加压实测（200 次搜索、每桌真下 12 手）：
 
@@ -207,8 +207,27 @@ Rapfi 随后以 `external/rapfi` Git 子模块加入，固定提交 `3c94c2a976f
 
 即**每桌约 16–30 MB**（边际约 16.5 MB）：网络权重只有 0.56 M 参数≈2 MB，占大头的是每桌各自的 MCTS 树。所以 10 桌满员也就几百 MB，**内存根本不是瓶颈，CPU 才是**——每张棋桌独立搜索，同时思考的人越多每人越慢。README 与 `--max-sessions` 的帮助文本都已按实测值改正，并把“别调大”改成“吃力就调小”。
 
-顺带修掉一个隐患：`az/web/index.html` 里写死的占位文案 `0 / 3 桌` 改为 `0 / 0 桌`。页面上的桌数与上限本来由 `/api/config` 的 `max_sessions` / `sessions` 填充，只有首帧会露出占位值；把它写成具体数字，下一次调整上限时就会再次变成谎话。
+顺带修掉一个隐患：`vk/web/index.html` 里写死的占位文案 `0 / 3 桌` 改为 `0 / 0 桌`。页面上的桌数与上限本来由 `/api/config` 的 `max_sessions` / `sessions` 填充，只有首帧会露出占位值；把它写成具体数字，下一次调整上限时就会再次变成谎话。
 
 **测量过程中的一个教训**：第一次测（空棋桌，不建对局）得到的内存增量是**完全一致的 +0.0 MB**——因为 `Table` 只在开局时才创建网络与搜索树，空表几乎不占内存。若不建对局就下结论，会得出“并发数随便调”的错误答案；这个 −0.0 也提醒我该去核对测量对象，而不是直接采信。
 
 验证：`tests/test_webui.py` 由 21 项增至 **22 项**。`test_share_capacity_is_enforced_and_released` 原先依赖共享 fixture 的 `max_sessions=3`，现在自带一个显式 3 桌的小服务，只验证“拒绝而非驱逐、离开即释放”这一机制，不再让用例数量与默认值绑死；新增 `test_the_default_share_capacity_is_ten` 用 `Sessions` 直接顶到边界（第 10 张必须放行、第 11 张必须被拒，且 10 张互不相同），再断言 `make_server` 报给页面的上限也是 10——避免“页面写着 10 桌、服务只放 3 个”这类前后端不一致。全量 **87 passed, 1 skipped**。真实服务复验：启动日志打印“最多 10 桌”，`/api/config` 返回 `max_sessions: 10`，连开 10 位访客各得独立棋桌、第 11 位收到 429。
+
+## 项目更名：AlphaZero / az → Visk / vk（2026-09-10 追加）
+
+用户认为“AlphaZero + az”不好听，要求换名。选定 **Visk**，包名 **vk**。
+
+命名理由：原名字直接借用了 DeepMind 的项目名，既缺乏辨识度，也与实现不符（README 本身就写明“是简化系统，不是原论文的复刻”）；本项目真正的身份是五子棋/连珠引擎。`Visk` 由 vi(五) + victory 缩合而成，单音节、易记，且 PyPI 上未被占用。两个候选名被否决：`Tesuji` 与 `Sente` 在 PyPI 上已被 Go 语言库占用，`Pente` 是 Parker Brothers 的注册商标棋类游戏，用它命名五子棋引擎会造成混淆。
+
+改动范围（一次性更名，共 56 处模块引用 + 全部对外文案）：
+
+- 目录 `az/` → `vk/`（用 `git mv`，历史按重命名记录而非删除+新增）。
+- 导入与 monkeypatch 目标 `az.*` → `vk.*`；`main.py` 入口不变。
+- 对外文案：CLI 描述、`Visk Web UI:` 启动行、HTTP `Server` 头（`RenjuWebUI` → `ViskWebUI`）、页面标题与页脚（`RENJU LAB` / `ALPHAZERO` → `VISK`）。
+- README 标题改为「Visk · 双规则五子棋」/「Visk — Dual-Rule Gomoku / Renju」；`pyproject.toml` 描述同步。
+
+**刻意保留**：README 末尾对 AlphaGo Zero 与 OpenSpiel AlphaZero 的**方法引用**属于学术出处，不是自身品牌，保持原样；`pyproject.toml` 描述里保留 “AlphaZero” 是为了说明所用算法，而不是项目名。
+
+更名是纯机械替换，但有两处容易踩的坑已避开：`az` 作为子串出现在 `lazy`、`.pytest_cache`、`artifacts` 等词中，因此正则限定为 `\baz` 且后接 `.` 或 `/`；替换前先清掉所有 `__pycache__`，避免旧字节码让 `import az` 仍能命中。
+
+验证：全量 **87 passed, 1 skipped**；新包导入自检通过、`import az` 按预期报 `ModuleNotFoundError`；真实服务复验（`artifacts/verification/rename-smoke.py`）确认页面标题/页脚/Server 头均为 Visk，且随包迁移的静态资源 `/app.js`、`/style.css` 仍返回 200（包目录改名后最容易断的一环）。

@@ -1,4 +1,4 @@
-# 双规则五子棋 AlphaZero
+# Visk · 双规则五子棋
 
 简体中文 | [English](README.en.md)
 
@@ -70,7 +70,7 @@ Get-NetIPAddress -AddressFamily IPv4 | Where-Object AddressState -eq Preferred
 启动日志形如：
 
 ```text
-Renju Web UI: http://127.0.0.1:8765 (CPU inference; training continues)
+Visk Web UI: http://127.0.0.1:8765 (CPU inference; training continues)
 分享链接（最多 10 桌）: http://192.168.1.3:8765/?k=<随机串>
 ```
 
@@ -94,7 +94,7 @@ Renju Web UI: http://127.0.0.1:8765 (CPU inference; training continues)
 输出形如：
 
 ```text
-Renju Web UI: http://127.0.0.1:8765 (CPU inference; training continues)
+Visk Web UI: http://127.0.0.1:8765 (CPU inference; training continues)
 分享链接（最多 10 桌，进入时需输入口令）: http://192.168.1.3:8765/?k=<随机串>
 正在为公网访问启动 Cloudflare 隧道（cloudflared 需能连上外网）……
 
@@ -247,7 +247,7 @@ python main.py train --rule renju --config configs/smoke.json --output artifacts
 
 测试覆盖四方向胜负、长连、真假三三、同方向/交叉双四、边界与满盘、合法动作、搜索回传符号、立即取胜和必要防守、增强对齐、完整对局标签、实际参数更新、断点恢复、停止、规则隔离和 worker 异常传播。
 
-实现分层：`main.py` 是统一命令入口；`az/game.py` 为规则；`az/search.py` 为 MCTS；`az/selfplay.py` 为多进程采样；`az/network.py` 为网络和推理；`az/training.py` 为优化与恢复；`az/evaluation.py` 为对战评估；`az/cli.py` 负责命令解析。
+实现分层：`main.py` 是统一命令入口；`vk/game.py` 为规则；`vk/search.py` 为 MCTS；`vk/selfplay.py` 为多进程采样；`vk/network.py` 为网络和推理；`vk/training.py` 为优化与恢复；`vk/evaluation.py` 为对战评估；`vk/cli.py` 负责命令解析。
 
 方法参考：[AlphaGo Zero](https://deepmind.google/blog/alphago-zero-starting-from-scratch/)、[DeepMind OpenSpiel AlphaZero](https://github.com/google-deepmind/open_spiel/blob/master/docs/alpha_zero.md)、[PyTorch CUDA 安装](https://pytorch.org/get-started/previous-versions/)。本项目是针对五子棋的简化 AlphaZero 系统，不是原论文计算规模或完整实现的复刻。
 

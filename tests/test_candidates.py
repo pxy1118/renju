@@ -1,9 +1,9 @@
 import numpy as np
 import pytest
 
-from az.candidates import immediate_wins, tactical_candidates
-from az.game import Game
-from az.teacher import symmetry
+from vk.candidates import immediate_wins, tactical_candidates
+from vk.game import Game
+from vk.teacher import symmetry
 
 
 @pytest.mark.parametrize("direction,start", [

@@ -4,10 +4,10 @@ import textwrap
 import numpy as np
 import torch
 
-from az.game import Game
-from az.pretraining import pretrain
-from az.teacher import generate_teacher_dataset
-from az.training import DEFAULTS, load_checkpoint, train
+from vk.game import Game
+from vk.pretraining import pretrain
+from vk.teacher import generate_teacher_dataset
+from vk.training import DEFAULTS, load_checkpoint, train
 
 
 def dynamic_engine(path):
@@ -84,7 +84,7 @@ def test_64_sample_overfit_save_and_weight_only_init(tmp_path, monkeypatch):
                       learning_rate=0.01, final_learning_rate=0.001)
     assert report["test"]["top1"] == 1 and (pretrained / "best.pt").is_file()
 
-    import az.training as module
+    import vk.training as module
     sample = [(Game().encode(), np.eye(1, 225, 112, dtype=np.float32)[0], 1.0)]
     stats = {"winner": 1, "moves": [], "simulations": 1}
     perf = {"seconds": 1, "batches": 1, "inference_positions": 1,

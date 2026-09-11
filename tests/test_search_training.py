@@ -3,13 +3,13 @@ import json
 import numpy as np
 import pytest
 import torch
-from az.game import Game
-from az.search import MCTS, SearchStopped
-from az.network import Network, Evaluator
-from az.training import DEFAULTS, augment, update, save, load_checkpoint, train, reconcile_jsonl
-from az.selfplay import play_game, collect
-from az.evaluation import summary, match
-from az.cli import read_config
+from vk.game import Game
+from vk.search import MCTS, SearchStopped
+from vk.network import Network, Evaluator
+from vk.training import DEFAULTS, augment, update, save, load_checkpoint, train, reconcile_jsonl
+from vk.selfplay import play_game, collect
+from vk.evaluation import summary, match
+from vk.cli import read_config
 
 
 def uniform(state):
@@ -164,7 +164,7 @@ def test_paired_statistics_and_config(tmp_path):
 
 
 def test_project_gpu_lock_and_release(tmp_path,monkeypatch):
-    import az.cli as cli
+    import vk.cli as cli
     monkeypatch.setattr(cli,"ROOT",tmp_path)
     with cli.gpu_lock("cuda"):
         with pytest.raises(RuntimeError,match="Another project process"):
