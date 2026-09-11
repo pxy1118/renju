@@ -10,5 +10,7 @@ wheels/
 .venv
 runs/
 artifacts/
+data/teacher/
+external/rapfi-runtime/
 .pytest_cache/
 *.tmp

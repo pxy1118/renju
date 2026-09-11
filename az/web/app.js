@@ -1,5 +1,5 @@
 const $ = id => document.getElementById(id);
-let state = null, token = '', config = {models:{}, recent:{}, ready:false}, selection = 'latest', color = 'black';
+let state = null, token = '', config = {models:{}, recent:{}, ready:false, share:false, max_sessions:0}, selection = 'latest', color = 'black';
 let pending = false, revision = 0, disconnected = false, lastMoveSeconds = null;
 const letters = 'ABCDEFGHIJKLMNO';
 const cells = [];
@@ -30,13 +30,27 @@ function availability() {
   showCheckpoints(rule);
   if (!config.ready) $('availability').textContent = '正在读取模型列表…';
   else if (has) $('availability').textContent = selection === 'latest' ? '已找到检查点 · 可开始对弈'
-    : selection === 'best' ? '已找到历史最佳 · 可开始对弈' : '已选定历史检查点 · 可开始对弈';
+    : selection === 'best' ? '已找到 Champion / 预训练最佳 · 可开始对弈' : '已选定模型 · 可开始对弈';
   else $('availability').textContent = `暂无${ruleName(rule)}模型，等待训练保存检查点${config.recent[rule]?.length ? '（已列出更早的检查点）' : ''}。训练每轮结束时写入，完成后刷新本页。`;
   // Never disable this button: clicking it explains why a rule is unavailable.
   $('new').disabled = !!pending || !!state?.busy;
   $('new').innerHTML = !config.ready ? '开始对弈 <span>↗</span>'
     : has ? (state?.id ? '重新开始 <span>↗</span>' : '开始对弈 <span>↗</span>')
           : '暂无可用模型 <span>↗</span>';
+  showShare();
+}
+// Sharing is opt-in on the server; when it is on, this page also tells its own
+// player whether the link it shows can actually be reached by anyone else.
+function showShare() {
+  const on = !!config.share;
+  $('share-panel').hidden = !on;
+  $('badge').textContent = on ? `分享对弈 · 最多 ${config.max_sessions} 桌` : '本地对弈 · CPU 推理';
+  if (!on) return;
+  const used = state?.sessions ?? config.sessions ?? 0;
+  $('share-count').textContent = `${used} / ${config.max_sessions} 桌`;
+  if ($('invite').value !== (config.invite || '')) $('invite').value = config.invite || '';
+  $('invite-note').textContent = !config.invite ? '当前地址别人访问不到：请用 --host <局域网IP> 启动服务。'
+    : config.password ? '对方打开链接后需要再输入访问口令。' : '对方打开链接即可入局。';
 }
 // A selection is usable when it is an alias the server resolves or a file it listed.
 function checkpointFile(rule, wanted) {
@@ -49,10 +63,13 @@ function checkpointFile(rule, wanted) {
 let checkpointSignature = '';
 function showCheckpoints(rule) {
   const entry = config.models[rule] || {};
-  const options = [{value:'latest', label: entry.latest ? `最新检查点 · ${entry.latest}` : '最新检查点（暂无）'},
-                   {value:'best', label: entry.best ? `历史最佳 · ${entry.best}` : '历史最佳（暂无）'}];
+  const options = [{value:'latest', label: entry.latest ? `最新模型 · ${entry.latest}` : '最新模型（暂无）'},
+                   {value:'best', label: entry.best ? `Champion / 预训练最佳 · ${entry.best}` : 'Champion / 预训练最佳（暂无）'}];
   for (const item of config.recent[rule] || []) {
-    if (item.name !== entry.latest) options.push({value:item.name, label:`${item.name.replace('checkpoint-','#').replace('.pt','')} · ${item.mtime} · ${item.mb}MB`});
+    if (item.name !== entry.latest && item.name !== entry.best) {
+      const file = item.name.split('/').at(-1).replace('checkpoint-','#').replace('.pt','');
+      options.push({value:item.name, label:`${item.run} / ${file} · ${item.mtime} · ${item.mb}MB`});
+    }
   }
   const signature = rule + '|' + options.map(o => o.value + o.label).join('|');
   const select = $('checkpoint');
@@ -119,7 +136,7 @@ function render() {
   $('count').textContent = `第 ${s.history.length} 手`;
   $('hint').textContent = !active ? '选择右侧设置，开始与模型对弈' : busy ? '正在本地搜索，请稍候…' : s.model.rule === 'renju' ? '黑首子天元 · 黑方三三、四四、长连禁手' : '点击交叉点落子 · 连成五子或以上获胜';
   $('undo').disabled = !active || busy || !!s.error || !s.history.some((_,i) => (i%2 === 0 ? 1 : -1) === s.human);
-  $('model-name').textContent = active ? `${ruleName(s.model.rule)} / ${s.model.checkpoint === 'best' ? '历史最佳' : '指定检查点'}` : '尚未载入';
+  $('model-name').textContent = active ? `${ruleName(s.model.rule)} / ${s.model.checkpoint === 'best' ? 'Champion / 预训练最佳' : s.model.checkpoint === 'latest' ? '最新模型' : '指定模型'}` : '尚未载入';
   $('model-detail').textContent = s.model.file ? `${s.model.file} · ${s.model.simulations} 次搜索${s.model.step != null ? ' · 训练 '+s.model.step+' 步' : ''}` : active ? '正在读取权重…' : '开始对弈后显示检查点信息';
   $('elapsed').textContent = active ? `${s.history.length} 手` + (!finished && lastMoveSeconds != null ? ` · 上手 ${lastMoveSeconds.toFixed(2)}s` : '') : '—';
   $('history-count').textContent = `${s.history.length} MOVES`;
@@ -146,6 +163,19 @@ $('new').onclick = () => {
   mutate('/api/new', {rule:$('rule').value, color, checkpoint:selection, simulations:Number($('simulations').value)});
 };
 $('undo').onclick = () => mutate('/api/undo', {id:state.id});
+$('invite-copy').onclick = async () => {
+  const link = $('invite').value;
+  if (!link) return;
+  try { await navigator.clipboard.writeText(link); $('invite-copy').textContent = '已复制'; }
+  catch (e) { $('invite').select(); showError('浏览器不允许自动复制，请手动复制上面的链接。'); }
+  setTimeout(() => { $('invite-copy').textContent = '复制'; }, 1500);
+};
+// Leaving frees the slot for someone else; the next visit asks for the link again.
+$('leave').onclick = async () => {
+  if (!confirm('结束本桌？当前棋局会立即丢弃，名额让给其他人。')) return;
+  try { await api('/api/leave', {}); } catch (e) { showError(e.message); return; }
+  location.replace('/');
+};
 $('numbers').onchange = render;
 document.querySelectorAll('.color').forEach(b => b.onclick = () => {
   color = b.dataset.color;
