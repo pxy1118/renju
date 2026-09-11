@@ -12,11 +12,18 @@ from .selfplay import collect
 
 DEFAULTS = dict(rule="freestyle", arch=DEFAULT_ARCH, channels=128, blocks=10,
                 simulations=200, cpuct=2.0,
+                candidates="tactical", search="mcts", opening_mode="sampled",
+                opening_book=None,
                 temperature_moves=20, workers=16, games_per_round=32, train_steps=200,
                 replay_capacity=100000, batch_size=256, learning_rate=0.001,
                 weight_decay=0.0001, seed=20260910, eval_every=10, eval_pairs=10,
                 min_replay_size=1, promotion_every=10, promotion_pairs=10,
                 opening_plies=8)
+
+# Which string-valued configuration keys exist and what they may be set to.
+STRING_OPTIONS = {"candidates": ("tactical", "forced", "legal"),
+                  "search": ("mcts", "policy"),
+                  "opening_mode": ("sampled", "teacher", "book", "none")}
 
 # Fields a resume may legitimately change: both describe how data is gathered
 # in this process, not what the stored model and optimizer mean.
@@ -100,7 +107,7 @@ def save(root, cfg, model, optimizer, replay, rng, round_id, step, total_games, 
              "rng": rng.bit_generator.state, "python_rng": random.getstate(),
              "torch_rng": torch.get_rng_state(),
              "cuda_rng": torch.cuda.get_rng_state_all() if next(model.parameters()).is_cuda else None}
-    state.update({"candidate_mode": "tactical_square3_line4",
+    state.update({"candidate_mode": cfg.get("candidates", "tactical"),
                   "champion_model": champion_model, "champion_optimizer": champion_optimizer,
                   "champion_step": champion_step, "teacher": teacher})
     path = Path(root) / f"checkpoint-{round_id:08d}-{step:010d}.pt"
@@ -211,7 +218,7 @@ def train(cfg, root, device, seconds, resume=None, stop=lambda: False, max_round
     if not (root / "best.pt").exists():
         atomic_save({"format": 1, "config": cfg, "model": champion_state,
                      "step": champion_step, "teacher": teacher,
-                     "candidate_mode": "tactical_square3_line4"}, root / "best.pt")
+                     "candidate_mode": cfg.get("candidates", "tactical")}, root / "best.pt")
     rounds_this_run = 0
     last_path = None
     while time.monotonic() < deadline and not stop():
@@ -258,7 +265,7 @@ def train(cfg, root, device, seconds, resume=None, stop=lambda: False, max_round
                 champion.load_state_dict(champion_state)
                 atomic_save({"format": 1, "config": cfg, "model": champion_state,
                              "step": champion_step, "teacher": teacher,
-                             "candidate_mode": "tactical_square3_line4"}, root / "best.pt")
+                             "candidate_mode": cfg.get("candidates", "tactical")}, root / "best.pt")
             else:
                 model.load_state_dict(champion_state)
                 optimizer.load_state_dict(champion_optimizer)

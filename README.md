@@ -26,7 +26,111 @@ python main.py evaluate --rule freestyle --checkpoint best --output runs/freesty
 python main.py evaluate --rule freestyle --checkpoint latest --output runs/freestyle-hybrid --opponent checkpoint --opponent-checkpoint runs/freestyle/checkpoint-old.pt --pairs 64 --minutes 120
 ```
 
-教师默认运行 4 个进程，每进程 4 线程、256 MB Hash、200,000 节点，读取最后一个完整的 Top-5 深度；单次 5 秒超时，进程最多重启两次。YXBOARD 按当前行棋方编码（`1=当前方`、`2=对手`）。残缺输出、重复/非法落点和持续失败会显式报错，不产生替代标签。数据按整局分到 80/10/10，再仅对训练批次做 D4 增强；v2 NPZ 不允许 pickle，每片最多 4096 条，`manifest.json` 记录生成参数及可执行文件、配置和权重哈希。`data/teacher/` 已被 Git 忽略。
+教师默认运行 4 个进程，每进程 4 线程、256 MB Hash、200,000 节点，读取最后一个完整的 Top-5 深度；单次 5 秒超时，进程最多重启两次。YXBOARD 按当前行棋方编码（`1=当前方`、`2=对手`）。残缺输出、重复/非法落点和持续失败会显式报错，不产生替代标签。数据按整局分到 80/10/10，再仅对训练批次做 D4 增强；NPZ 不允许 pickle，每片最多 4096 条，`manifest.json` 记录生成参数及可执行文件、配置和权重哈希。`data/teacher/` 已被 Git 忽略。
+
+### 数据格式 3：逐着法胜率与真实代价
+
+格式 2 的 `policy[i]` 是 Rapfi 胜率的 odds 变换再做 softmax 归一化（并与本地候选集 98/2 混合）的结果，它是一组**着法分配质量**，不是胜率。把两个位置上的 `policy` 相减得到的并不是胜率差，历史记录里的“23% 真错率”正是这样被误读的。
+
+格式 3 在原有七个字段之外增加：
+
+| 字段 | dtype | 含义 |
+|---|---|---|
+| `teacher_topk_actions` | `uint8 (N,5)` | Rapfi MultiPV 分析到的着法，按胜率降序；不足 5 个填 `255` |
+| `teacher_topk_winrates` | `float16 (N,5)` | 上述着法的**原始胜率**（侧行棋方视角），不做任何变换 |
+
+格式 2 的旧数据仍然可读：合并或读取时这些行写成哨兵（`actions == 255`、`winrates == NaN`），用 `vk.datasets.topk_valid()` 判断某行是否有真实胜率，不需要额外的旁路文件。`vk.datasets.combine_datasets()` 可把 v2 与 v3 数据集合并为一个，重编号时会同时改写高位，因此同一局的所有位置始终落在同一个 split。
+
+`artifacts/diag_teacher_regret.py` 用这个尺度测量模型的实际代价：
+
+```powershell
+python artifacts/diag_teacher_regret.py --dataset data/teacher/freestyle-v2 --checkpoint runs/freestyle-pretrain/best.pt --engine external/rapfi-runtime/pbrain-rapfi.exe --engine-dir external/rapfi-runtime --split test --limit 1500 --candidates tactical
+```
+
+对每个局面它取**一次** Rapfi Top-5 根搜索作为参照：若模型着法在 Top-5 内，`regret = p_top1 - p_模型`（同一次搜索，无需额外查询）；否则再分析模型着法之后的子局面，用 `regret = p_top1 + p_child - 1`。所有数字都是**原始胜率百分点**（`0.05` 就是损失 5 个百分点），报告分桶、分 ply 段、以及“top1 与 top2 差距 > 0.05”的决策关键子集，并输出逐行 CSV。Rapfi 的作答按 `(局面, 引擎, 节点预算)` 缓存，可中断续跑。
+
+### 解耦 policy / value / MCTS / 候选集
+
+`--search`、`--candidate-mode`、`--opening-mode` 三个开关互相独立，用来判断每个部件的真实贡献（命令行的显式参数优先于配置文件和 checkpoint 内保存的配置）：
+
+| 开关 | 取值 | 含义 |
+|---|---|---|
+| `--search` | `mcts` / `policy` | MCTS+价值，或直接取策略 argmax（不搜索、不用价值头） |
+| `--candidate-mode` | `tactical` / `forced` / `legal` | 历史 `square3_line4` 硬裁剪 / 只保留成五与必挡 / 全部合法点 |
+| `--opening-mode` | `sampled` / `teacher` / `book` / `none` | 统一随机平衡开局 / 教师式开局（随机首手后按 Rapfi Top-5 采样） / 均势开局库 / 空盘 |
+
+### 均势开局库（`--opening-mode book`）
+
+无禁手是黑先手必胜的游戏：v3 教师数据 772 局里 **93.4% 是黑胜**，所以"执白胜率"基本是规则常数，而随机落子的开局压不住先手优势。`artifacts/opening_book_generate.py` 把"公平"从随机改成**被验证过**：
+
+```powershell
+# 生成：采样候选 → 用 Rapfi 测量黑白双方胜率 → 只保留双侧都在 0.5±gap 内 → D4 去重
+python artifacts/opening_book_generate.py --output data/openings/freestyle-balanced.json --engine external/rapfi-runtime/pbrain-rapfi.exe --engine-dir external/rapfi-runtime --count 200 --candidates 9000 --gap 0.15 --filter-nodes 200000 --workers 4
+# 复验：换一次搜索重测同一批开局，报逐开局漂移
+python artifacts/opening_book_generate.py --verify data/openings/freestyle-balanced.json --output artifacts/opening-verify.json --engine external/rapfi-runtime/pbrain-rapfi.exe --engine-dir external/rapfi-runtime --filter-nodes 200000 --verify-sample 50
+python main.py evaluate --rule freestyle --checkpoint best --output runs/policy-baseline --opponent rapfi --engine external/rapfi-runtime/pbrain-rapfi.exe --engine-dir external/rapfi-runtime --pairs 25 --opening-mode book --opening-book data/openings/freestyle-balanced.json
+```
+
+实测结果与它的局限（**逐开局平衡在 64 倍节点跨度上摆动 0.12–0.53，只有总体分布可信**）见 [验收记录](ACCEPTANCE.md) 第九节。相同的 `--opening-mode book` 也能用于自博弈：`collect`/`play_game` 会按 seed 在库内轮转。
+
+
+四种组合的对照（同一 checkpoint、同一 200k 节点 Rapfi、同一开局种子，`--pairs` 是**开局对数**，实际对局数为其两倍）：
+
+```powershell
+# A1 policy+forced   A2 policy+legal   A3 mcts+tactical   A4 mcts+legal
+python main.py evaluate --rule freestyle --checkpoint best --output runs/freestyle-pretrain --opponent rapfi --engine external/rapfi-runtime/pbrain-rapfi.exe --engine-dir external/rapfi-runtime --pairs 25 --minutes 120 --search policy --candidate-mode forced
+python main.py evaluate --rule freestyle --checkpoint best --output runs/freestyle-pretrain --opponent rapfi --engine external/rapfi-runtime/pbrain-rapfi.exe --engine-dir external/rapfi-runtime --pairs 25 --minutes 120 --search policy --candidate-mode legal
+python main.py evaluate --rule freestyle --checkpoint best --output runs/freestyle-pretrain --opponent rapfi --engine external/rapfi-runtime/pbrain-rapfi.exe --engine-dir external/rapfi-runtime --pairs 25 --minutes 120 --candidate-mode tactical
+python main.py evaluate --rule freestyle --checkpoint best --output runs/freestyle-pretrain --opponent rapfi --engine external/rapfi-runtime/pbrain-rapfi.exe --engine-dir external/rapfi-runtime --pairs 25 --minutes 120 --candidate-mode legal
+```
+
+每个报告都带 `search_mode`/`candidates`/`opening_mode`/`opening_seed`，以及搜索形状诊断：`root_visited_moves`、`root_max_visit_share`、`root_visit_entropy`。它们才是“搜索有没有展开”的证据——`节点访问数 / 模拟次数` 恒等于 1，没有信息量。跨臂比较用 `vk.evaluation.paired_delta()` 在同一开局上做成对 bootstrap 区间，而不是并排看两个 Wilson 区间。
+
+模型先手、Rapfi 标注的 DAgger 式数据：
+
+```powershell
+python artifacts/dagger_collect.py --checkpoint runs/freestyle-pretrain/best.pt --engine external/rapfi-runtime/pbrain-rapfi.exe --engine-dir external/rapfi-runtime --output data/teacher/dagger-v1 --positions 2000 --candidates legal --search policy
+python main.py pretrain --rule freestyle --dataset data/teacher/freestyle-v2 --mix-dataset data/teacher/dagger-v1 --mix-share 0.5 --output runs/freestyle-pretrain-v3 --steps 20000
+```
+
+DAgger 输出仍是标准格式 3；每条决策的 `regret` 与 `hard` 只写在 `diagnostics.csv` 里，不进训练 schema。`pretrain --value-weight 0` 训练纯策略模型：此时 loss、best checkpoint 的选择分数、以及战术闸门都会同步切换（闸门改为策略 argmax + 强制着法），`value_mae` 不再作为验收项。
+
+`scripts/compare_arms.py` 一次跑完 A1–A4 并直接给出成对区间（`--pairs` 是开局对数）：
+
+```powershell
+python scripts/compare_arms.py --checkpoint runs/freestyle-pretrain/best.pt --engine external/rapfi-runtime/pbrain-rapfi.exe --engine-dir external/rapfi-runtime --pairs 25 --output artifacts/compare-arms
+```
+
+结果写入 `artifacts/compare-arms/<arm>.json` 与 `comparison.json`。本轮实录见 [验收记录](ACCEPTANCE.md) 的「度量修正与四旋钮解耦」。
+
+### critical-regret 加权与子局面价值标签
+
+教师数据里绝大多数局面「怎么走都差不多」，真正决定棋力的是少数 `top1 - top2 > 0.05` 的决策点。加权训练把预算移到后者，**权重进采样器而不是 loss**，因此目标函数不变：
+
+```powershell
+python main.py pretrain --rule freestyle --dataset data/teacher/freestyle-v3 --output runs/critical --steps 20000 --value-weight 0 --critical-weighting
+```
+
+默认分桶 `gap<0.01 → 0.25`、`0.01–0.03 → 0.5`、`0.03–0.05 → 1.0`、`0.05–0.10 → 2.0`、`>0.10 → 4.0`（`vk.datasets.DEFAULT_GAP_WEIGHTS`），需要格式 3 的 top-k 胜率；格式 2 数据会显式报错而不是静默退回均匀采样。
+
+**实测结论（阴性）**：在 50k v3 数据上，`--critical-weighting` 确实把 82.5% 的批预算给到 gap>0.03 的 41.9% 局面（gap>0.10 的 9.2% 单独占 38.8%），但同架构、同种子、同步数的对照模型在配对 regret 上没有改善（`A − B = +0.0020`，95% CI `[−0.0042, +0.0084]`），决策关键子集上点估计还略微反向（0.1417 → 0.1501）。原因是采样加权不改变目标函数的最优解。详见 [验收记录](ACCEPTANCE.md) 的「critical 加权实测」。
+
+两个模型在同一批局面上配对比较（根搜索共享，只为 Top-5 之外的着法各查一次子局面）：
+
+```powershell
+python artifacts/diag_teacher_regret.py --dataset data/teacher/freestyle-v3 --checkpoint runs/freestyle-pretrain/best.pt --compare-checkpoint runs/critical/best.pt --engine external/rapfi-runtime/pbrain-rapfi.exe --engine-dir external/rapfi-runtime --split test --limit 1500 --candidates legal
+```
+
+报告里的 `paired` 段给出 `mean_regret_delta` 与 bootstrap 95% 区间（正数表示第二个模型更省胜率）。
+
+价值标签能不能区分同一父局面的不同着法，是这个工具要回答的问题：
+
+```powershell
+python artifacts/value_dataset_diagnostic.py --dataset artifacts/teacher-probe-v3 --split train --limit 0 --output artifacts/value-children-probe
+```
+
+默认 `chained` 模式不需要引擎：用父局面的 `1 - W_i` 作为每个子局面的目标，一个父局面展开 k 行。加 `--engine` 则对每个子局面单独搜索。报告包含兄弟标签差的分位数与子局面 `|V|` 分布 —— 历史 value 饱和（叶节点 `|V|` 均值 0.963）的根因是「一个父局面只监督一个标量」，而不是标签里没有相对结构。
+
 
 `--init-checkpoint` 只读取网络参数和教师来源，不继承优化器或回放池，并与 `--resume` 互斥。由 `pretrain` 生成但未达到 Top-1 45%、Top-5 80%、价值 MAE 0.20 和战术全对门槛的检查点会被正式自博弈拒绝。旧格式 1 checkpoint 仍可推理和按原配置续训。
 

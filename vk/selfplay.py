@@ -7,19 +7,25 @@ import time
 import traceback
 import numpy as np
 from .game import Game
-from .openings import balanced_opening, opening_moves
+from .openings import balanced_opening, book_opening, load_opening_book, opening_moves
 from .search import MCTS, SearchStopped
 
 
 def play_game(rule, evaluator, simulations, seed, stop=lambda: False, cpuct=2.0,
-              temperature_moves=20, opening_plies=8, opening=None):
+              temperature_moves=20, opening_plies=8, opening=None, book=None):
     """Play one self-play game, optionally from a supplied opening position.
 
     ``opening`` is copied, never mutated: the caller keeps its own game so a
-    paired arena match can hand the same start to both colours.
+    paired arena match can hand the same start to both colours. ``book`` takes
+    precedence and walks the book cyclically by ``seed``, so self-play can start
+    from verified balanced positions instead of random stones.
     """
-    g = copy.copy(opening) if opening is not None \
-        else balanced_opening(rule, seed, opening_plies)
+    if book is not None:
+        g = book_opening(book, seed)
+    elif opening is not None:
+        g = copy.copy(opening)
+    else:
+        g = balanced_opening(rule, seed, opening_plies)
     # Reset after the opening so the exploration stream depends on the seed
     # alone, not on how many moves the opening happened to consume.
     rng = np.random.default_rng(seed)
@@ -61,6 +67,14 @@ def _actor(worker, tasks, requests, response, results, cancel, cfg):
                 except queue.Empty:
                     pass
             raise SearchStopped()
+        # A book is passed by path, never as an object: actors are spawned
+        # processes, so a loaded dict would not survive the trip.
+        book = None
+        if cfg.get("opening_mode") == "book":
+            path = cfg.get("opening_book")
+            if not path:
+                raise ValueError("opening_mode='book' requires an opening_book path")
+            book = load_opening_book(path, rule=cfg.get("rule"))
         while not cancel.is_set():
             seed = tasks.get()
             if seed is None:
@@ -68,7 +82,7 @@ def _actor(worker, tasks, requests, response, results, cancel, cfg):
             try:
                 data, stats = play_game(cfg["rule"], evaluate, cfg["simulations"], seed,
                                         cancel.is_set, cfg["cpuct"], cfg["temperature_moves"],
-                                        cfg.get("opening_plies", 8))
+                                        cfg.get("opening_plies", 8), book=book)
                 results.put(("game", data, stats))
             except SearchStopped:
                 return

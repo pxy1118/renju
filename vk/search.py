@@ -1,5 +1,5 @@
 import numpy as np
-from .candidates import tactical_candidates
+from .candidates import candidate_mask, forced_candidates
 
 
 class SearchStopped(Exception):
@@ -18,10 +18,11 @@ class Node:
 
 class MCTS:
     """Each edge Q is measured from its parent state's player perspective."""
-    def __init__(self, evaluator, simulations=200, cpuct=2.0, rng=None):
+    def __init__(self, evaluator, simulations=200, cpuct=2.0, rng=None, candidates="tactical"):
         self.evaluate = evaluator
         self.simulations = simulations
         self.cpuct = cpuct
+        self.candidates = candidates
         self.rng = rng if rng is not None else np.random.default_rng()
         self.root = Node()
         self.key = None
@@ -33,7 +34,7 @@ class MCTS:
         return game.rule, game.player, game.board.tobytes(), game.winner
 
     def expand(self, node, game):
-        candidates = tactical_candidates(game)
+        candidates = candidate_mask(game, self.candidates)
         legal = candidates.mask
         if not legal.any():
             game.adjudicate()
@@ -86,22 +87,72 @@ class MCTS:
                 parent.n[a] += 1
                 parent.w[a] += value
             self.completed += 1
+        if not self.root.n.any():
+            # Zero simulations (or all of them stopped early): there is no visit
+            # distribution to report, and dividing by its zero sum would warn.
+            self.last_stats = {
+                "candidate_count": self.root.candidate_count,
+                "candidate_mode": self.root.candidate_mode,
+                "candidates": self.candidates,
+                "forced_win": int(self.root.candidate_mode == "forced_win"),
+                "forced_defense": int(self.root.candidate_mode == "forced_defense"),
+                "strategic": int(self.root.candidate_mode == "strategic"),
+                "max_depth": max_depth, "search_prior_kl": 0.0, "value_abs_mean": 0.0,
+                "root_visited_moves": 0, "root_visited_share": 0.0,
+                "root_max_visit_share": 0.0, "root_visit_entropy": 0.0,
+                "mean_visits_per_visited_move": 0.0,
+            }
+            return np.zeros(225, np.float32)
         visits = self.root.n.astype(np.float64)
         policy = visits / visits.sum()
         support = (policy > 0) & (self.root.p > 0)
         kl = float(np.sum(policy[support] * np.log(policy[support] / self.root.p[support])))
+        visited = int((self.root.n > 0).sum())
+        share = policy[policy > 0]
         self.last_stats = {
             "candidate_count": self.root.candidate_count,
             "candidate_mode": self.root.candidate_mode,
+            "candidates": self.candidates,
             "forced_win": int(self.root.candidate_mode == "forced_win"),
             "forced_defense": int(self.root.candidate_mode == "forced_defense"),
             "strategic": int(self.root.candidate_mode == "strategic"),
             "max_depth": max_depth,
             "search_prior_kl": kl,
             "value_abs_mean": float(np.mean(values)) if values else 0.0,
+            # How far the search actually spread. Visits per move is not a
+            # signal (every simulation adds exactly one root visit), so report
+            # the shape of the visit distribution instead.
+            "root_visited_moves": visited,
+            "root_visited_share": visited / max(1, self.root.candidate_count),
+            "root_max_visit_share": float(share.max()) if len(share) else 0.0,
+            "root_visit_entropy": float(-(share * np.log(share)).sum()) if len(share) else 0.0,
+            "mean_visits_per_visited_move": float(visits.sum() / visited) if visited else 0.0,
         }
         return policy.astype(np.float32)
 
     def advance(self, action, game):
         self.root = self.root.children.get(int(action), Node())
         self.key = self.state_key(game)
+
+
+def policy_move(game, evaluator, candidates="forced"):
+    """Play the network's own ranking, with no search and no value head.
+
+    Deterministic tactics still apply: an available five is completed and a
+    five for the opponent is blocked. Everything else is the policy prior
+    restricted to ``candidates``.
+    """
+    restricted = forced_candidates(game) if candidates == "forced" else candidate_mask(game, candidates)
+    logits, _ = evaluator(game.encode())
+    logits = np.asarray(logits, dtype=np.float64)
+    if logits.shape != (225,) or not np.isfinite(logits).all():
+        raise RuntimeError("Invalid network policy output")
+    allowed = restricted.mask.copy()
+    if not allowed.any():
+        # The position is terminal; the caller only needs *a* legal action and
+        # the game ends before it is used.
+        allowed = game.legal()
+    if not allowed.any():
+        raise ValueError("Cannot choose a move: no legal placement")
+    scores = np.where(allowed, logits, -np.inf)
+    return int(np.argmax(scores)), restricted

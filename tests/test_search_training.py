@@ -5,7 +5,7 @@ import pytest
 import torch
 from vk.game import Game
 from vk.openings import balanced_opening
-from vk.search import MCTS, SearchStopped
+from vk.search import MCTS, SearchStopped, policy_move
 from vk.network import Network, Evaluator
 from vk.training import DEFAULTS, augment, update, save, load_checkpoint, train, reconcile_jsonl
 from vk.selfplay import play_game, collect
@@ -58,6 +58,78 @@ def test_legality_noise_and_stop():
 def test_invalid_inference_fails_explicitly():
     with pytest.raises(RuntimeError,match="Invalid network"):
         MCTS(lambda state:(np.full(225,np.nan),0),4).policy(Game())
+
+
+def test_focused_inference_must_not_leak_outside_the_candidate_mask():
+    """A move the candidate set forbids must stay unreachable, whatever the prior."""
+    g = Game()
+    g.board[105:109] = -1                     # White threatens five on the row
+    def biased(state):
+        logits = np.full(225, -30.0)
+        logits[7] = 20.0                      # far away, outside the mask
+        logits[105] = 1.0
+        return logits, 0.0
+    action, candidates = policy_move(g, biased, "forced")
+    assert candidates.mode == "forced_defense"
+    assert action in (104, 109), "only the two blocking points exist"
+    assert action != 7
+
+
+def test_policy_move_uses_the_raw_ranking_when_nothing_is_forced():
+    g = Game()
+    g.move(112)
+    def ranked(state):
+        logits = np.zeros(225)
+        logits[113] = 5.0
+        return logits, 0.9
+    action, candidates = policy_move(g, ranked, "legal")
+    assert candidates.mode == "all_legal"
+    assert action == 113
+
+
+def test_legal_candidates_give_every_point_a_prior_and_expose_search_shape():
+    g = Game()
+    g.move(112)
+    tree = MCTS(uniform, 40, 2.0, candidates="legal")
+    tree.policy(g)
+    stats = tree.last_stats
+    assert stats["candidate_mode"] == "all_legal"
+    assert stats["candidate_count"] == 224
+    assert (tree.root.p > 0).sum() == 224, "no legal point may start at zero prior"
+    # The point of these numbers is to show how far the search actually spread,
+    # which visits-per-move cannot: every simulation adds exactly one root visit.
+    assert stats["root_visited_moves"] <= 40
+    assert 0 < stats["root_max_visit_share"] <= 1
+    if stats["root_visited_moves"] == 1:
+        assert stats["root_max_visit_share"] == 1 and stats["root_visit_entropy"] == pytest.approx(0)
+
+
+def test_root_visit_shape_is_degenerate_when_all_visits_land_on_one_move():
+    g = Game()
+    g.board[100:104] = 1
+    def single(state):
+        logits = np.full(225, -30.0)
+        logits[104] = 10.0
+        return logits, 0.5
+    tree = MCTS(single, 30, 2.0, candidates="forced")
+    tree.policy(g)
+    stats = tree.last_stats
+    assert stats["root_visited_moves"] == 1
+    assert stats["root_max_visit_share"] == pytest.approx(1.0)
+    assert stats["root_visit_entropy"] == pytest.approx(0.0)
+    assert stats["mean_visits_per_visited_move"] == pytest.approx(30.0)
+
+
+def test_zero_simulations_report_no_visit_distribution():
+    tree = MCTS(uniform, 0)
+    pi = tree.policy(Game())
+    assert not pi.any()
+    assert tree.last_stats["root_visited_moves"] == 0
+    assert tree.last_stats["root_max_visit_share"] == 0.0
+
+
+def test_tactical_candidates_remain_the_default():
+    assert MCTS(uniform, 4).candidates == "tactical"
 
 
 @pytest.mark.parametrize("rule", ["freestyle","renju"])

@@ -11,7 +11,7 @@ from .game import Game
 from .network import (ARCHITECTURES, Network, Evaluator, architecture,
                       architecture_of, device_check, parameter_count)
 from .search import MCTS
-from .training import DEFAULTS, train, checkpoint_path, load_checkpoint
+from .training import DEFAULTS, STRING_OPTIONS, train, checkpoint_path, load_checkpoint
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -53,7 +53,14 @@ def read_config(path, rule):
         cfg.update(values)
     cfg["rule"] = rule
     for k, v in cfg.items():
-        if k in ("rule", "arch"):
+        if k in ("rule", "arch", "opening_book"):
+            # ``opening_book`` is a path or None; its existence is checked by
+            # whoever loads it, which fails loudly before any game starts.
+            continue
+        if k in STRING_OPTIONS:
+            if v not in STRING_OPTIONS[k]:
+                raise ValueError(f"Invalid configuration: {k}={v!r} "
+                                 f"(known: {list(STRING_OPTIONS[k])})")
             continue
         if not isinstance(v,(float,int)) or isinstance(v,bool) or v < 0:
             raise ValueError(f"Invalid configuration: {k}")
@@ -109,10 +116,34 @@ def main():
     p.add_argument("--init-checkpoint")
     p.add_argument("--checkpoint", default="latest")
     p.add_argument("--max-rounds", type=int)
-    p.add_argument("--pairs", type=int, default=10)
+    p.add_argument("--pairs", type=int, default=10,
+                   help="opening pairs; a pair plays both colours, so games = 2 x pairs")
     p.add_argument("--workers", type=int, help="parallel self-play processes; may be changed when resuming")
     p.add_argument("--human-color", choices=["black","white"], default="black")
     p.add_argument("--dataset")
+    p.add_argument("--mix-dataset", help="second teacher dataset mixed into pretraining")
+    p.add_argument("--mix-share", type=float, default=0.5,
+                   help="share of pretraining batches drawn from --mix-dataset (default 0.5)")
+    p.add_argument("--policy-weight", type=float, default=1.0,
+                   help="weight of the policy cross-entropy in pretraining")
+    p.add_argument("--value-weight", type=float, default=1.0,
+                   help="weight of the value MSE in pretraining; 0 trains policy only")
+    p.add_argument("--critical-weighting", action="store_true",
+                   help="draw pretraining batches with a weight set by the teacher's "
+                        "top-1/top-2 winrate gap, so decision-critical positions get "
+                        "more of the budget (needs format-3 top-k data)")
+    p.add_argument("--candidate-mode", choices=["tactical","forced","legal"],
+                   help="candidate set for search: tactical keeps square3_line4 pruning, "
+                        "forced keeps only wins/blocks, legal keeps every legal point")
+    p.add_argument("--search", choices=["mcts","policy"],
+                   help="how the model picks a move: MCTS+value, or the raw policy argmax")
+    p.add_argument("--opening-mode", choices=["sampled","teacher","book","none"],
+                   help="opening procedure: sampled random stones, Rapfi-following, "
+                        "a verified balanced book, or the empty board")
+    p.add_argument("--opening-book", metavar="PATH",
+                   help="balanced opening book JSON (required by --opening-mode book)")
+    p.add_argument("--opening-seed", type=int,
+                   help="first opening seed; the same seed reproduces the same pair schedule")
     p.add_argument("--positions", type=int, default=50000)
     p.add_argument("--steps", type=int, default=20000)
     p.add_argument("--engine")
@@ -176,6 +207,23 @@ def main():
         p.error("Budgets, pairs and max-rounds must be positive")
     torch.set_num_threads(4)
     cfg = read_config(args.config, args.rule)
+    # Explicit flags win over both the configuration file and the checkpoint's
+    # stored config, so one run directory can be evaluated under several
+    # decoupled switches without editing JSON or writing a new checkpoint.
+    overrides = {key: value for key, value in (("candidates", args.candidate_mode),
+                                               ("search", args.search),
+                                               ("opening_mode", args.opening_mode),
+                                               ("opening_book", args.opening_book))
+                 if value is not None}
+    cfg.update(overrides)
+    # Refuse to start a run that cannot load its book, rather than failing on
+    # the first game.
+    from .evaluation import load_book
+    loaded_book = load_book(cfg)
+    if loaded_book is not None:
+        print(json.dumps({"opening_book": cfg["opening_book"],
+                          "openings": loaded_book["count"],
+                          "acceptance": loaded_book.get("acceptance")}), flush=True)
     root = Path(args.output) if args.output else ROOT / "runs" / args.rule
     stopping = [False]
     def stop_handler(signum, frame):
@@ -195,7 +243,12 @@ def main():
             from .pretraining import pretrain
             print(json.dumps(pretrain(args.dataset, args.output, args.rule, args.steps,
                                       cfg["batch_size"], cfg["arch"],
-                                      args.device, cfg["seed"])), flush=True)
+                                      args.device, cfg["seed"],
+                                      policy_weight=args.policy_weight,
+                                      value_weight=args.value_weight,
+                                      mix_dataset=args.mix_dataset,
+                                      mix_share=args.mix_share,
+                                      critical_weighting=args.critical_weighting)), flush=True)
             return
         if args.command == "doctor":
             model = Network().to(args.device)
@@ -245,7 +298,8 @@ def main():
         else:
             state = load_checkpoint(checkpoint_path(root,args.checkpoint),args.rule)
             cfg = state["config"]
-            model = Network(cfg["arch"]).to(args.device)
+            cfg.update(overrides)
+            model = Network(architecture_of(cfg)).to(args.device)
             model.load_state_dict(state["model"])
             del state
             if args.command == "evaluate":
@@ -256,7 +310,8 @@ def main():
                     report = {"rapfi": evaluate_rapfi(model, cfg, args.device, args.engine,
                               args.engine_dir, args.pairs, time.monotonic()+args.minutes*60,
                               lambda: stopping[0], args.engine_threads, args.engine_hash_mb,
-                              args.max_nodes, args.engine_timeout)}
+                              args.max_nodes, args.engine_timeout,
+                              args.opening_seed if args.opening_seed is not None else 91823)}
                 elif args.opponent == "checkpoint":
                     if not args.opponent_checkpoint:
                         p.error("Checkpoint evaluation requires --opponent-checkpoint")
@@ -275,7 +330,8 @@ def main():
             else:
                 g = Game(args.rule)
                 human = 1 if args.human_color == "black" else -1
-                tree = MCTS(Evaluator(model,args.device),cfg["simulations"],cfg["cpuct"])
+                tree = MCTS(Evaluator(model,args.device),cfg["simulations"],cfg["cpuct"],
+                            candidates=cfg.get("candidates", "tactical"))
                 while g.adjudicate() is None:
                     display(g)
                     if g.player == human:

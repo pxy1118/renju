@@ -7,8 +7,8 @@ import traceback
 import numpy as np
 from .game import Game, lengths
 from .network import Network, Evaluator, architecture_of
-from .openings import balanced_opening
-from .search import MCTS, SearchStopped
+from .openings import balanced_opening, book_opening, load_opening_book, sampled_opening
+from .search import MCTS, SearchStopped, policy_move
 from .training import load_checkpoint
 from .candidates import immediate_wins, tactical_candidates
 
@@ -20,6 +20,80 @@ def wilson_interval(score, games, z=1.959963984540054):
     center = (score + z * z / (2 * games)) / denominator
     radius = z * math.sqrt(score * (1 - score) / games + z * z / (4 * games * games)) / denominator
     return max(0.0, center - radius), min(1.0, center + radius)
+
+
+def bootstrap_interval(values, samples=2000, seed=20260910):
+    """Percentile bootstrap CI of the mean of ``values`` (list or array)."""
+    values = np.asarray(values, dtype=np.float64)
+    if not len(values):
+        return None
+    rng = np.random.default_rng(seed)
+    draws = values[rng.integers(0, len(values), size=(samples, len(values)))].mean(axis=1)
+    return [float(np.percentile(draws, 2.5)), float(np.percentile(draws, 97.5))]
+
+
+def paired_delta(results_a, results_b, samples=2000, seed=20260910):
+    """Paired score difference between two arms on identical openings.
+
+    Both arms must have been run on the same ``(pair, color)`` schedule, which
+    is what makes this a *paired* comparison: per-pair differences remove the
+    opening-to-opening variance that inflates the two separate Wilson intervals.
+    """
+    scores = {}
+    for label, results in (("a", results_a), ("b", results_b)):
+        for record in results:
+            scores.setdefault((record["pair"], record["color"]), {})[label] = (record["result"] + 1) / 2
+    shared = sorted(key for key, value in scores.items() if "a" in value and "b" in value)
+    if not shared:
+        return None
+    deltas = [scores[key]["a"] - scores[key]["b"] for key in shared]
+    mean = float(np.mean(deltas))
+    return {"pairs": len(shared), "delta_pp": mean * 100,
+            "delta_ci95_pp": [value * 100 for value in bootstrap_interval(deltas, samples, seed)],
+            "meaning": "positive means arm A scored higher than arm B on the same openings"}
+
+
+def opening(rule, seed, mode="sampled", plies=8, client=None, sample_plies=12, book=None):
+    if mode == "sampled":
+        return balanced_opening(rule, seed, plies)
+    if mode == "teacher":
+        return sampled_opening(rule, seed, plies, sample_plies, client)
+    if mode == "book":
+        if book is None:
+            raise ValueError("opening_mode='book' needs a loaded opening book")
+        return book_opening(book, seed)
+    if mode == "none":
+        return Game(rule)
+    raise ValueError(f"Unknown opening mode: {mode!r} "
+                     f"(known: ['sampled', 'teacher', 'book', 'none'])")
+
+
+def load_book(cfg):
+    """The book a run's config points at, or ``None`` for the sampled modes.
+
+    Centralised so a missing or mismatched book fails before any game starts,
+    rather than in the middle of a match.
+    """
+    if cfg.get("opening_mode") != "book":
+        return None
+    path = cfg.get("opening_book")
+    if not path:
+        raise ValueError("opening_mode='book' requires opening_book to point at a book file")
+    return load_opening_book(path, rule=cfg.get("rule"))
+
+
+def play_move(game, model, evaluator, cfg, search="mcts", candidates=None, tree=None,
+              stop=lambda: False):
+    """One move by the model: either MCTS+value or the raw policy ranking."""
+    candidates = candidates or cfg.get("candidates", "tactical")
+    if search == "policy":
+        action, _ = policy_move(game, evaluator, candidates)
+        return action
+    if search != "mcts":
+        raise ValueError(f"Unknown search mode: {search!r} (known: ['mcts', 'policy'])")
+    if tree is None:
+        tree = MCTS(evaluator, cfg["simulations"], cfg["cpuct"], candidates=candidates)
+    return int(np.argmax(tree.policy(game, stop=stop)))
 
 
 def tactical(game, rng):
@@ -39,6 +113,33 @@ def tactical(game, rng):
         scores.append(10*np.count_nonzero(b[max(0,r-2):r+3,max(0,c-2):c+3]) - abs(r-7)-abs(c-7))
     best = np.flatnonzero(np.array(scores) == max(scores))
     return int(legal[rng.choice(best)])
+
+
+def search_statistics(results):
+    """Aggregate per-move search diagnostics across completed games.
+
+    Keys no move reported (the MCTS numbers under ``search="policy"``) are left
+    out rather than published as null, so an absent field means "this arm has no
+    such measurement" instead of "the measurement was empty".
+    """
+    moves = [move for record in results for move in record.get("moves_detail", [])]
+    if not moves:
+        return {}
+    def mean(key):
+        values = [move[key] for move in moves if move.get(key) is not None]
+        return float(np.mean(values)) if values else None
+    modes = {}
+    for move in moves:
+        modes[move.get("candidate_mode")] = modes.get(move.get("candidate_mode"), 0) + 1
+    statistics = {"moves": len(moves), "candidate_mode_hist": modes,
+                  "ply_median": float(np.median(
+                      [len(record.get("moves", [])) for record in results if record.get("moves")]))}
+    for key in ("candidate_count", "value_abs_mean", "search_prior_kl", "root_visited_moves",
+                "root_max_visit_share", "root_visit_entropy", "mean_visits_per_visited_move"):
+        value = mean(key)
+        if value is not None:
+            statistics[f"{key}_mean" if key != "candidate_count" else "candidate_count_mean"] = value
+    return statistics
 
 
 def summary(results, expected):
@@ -61,16 +162,20 @@ def summary(results, expected):
         if len(window) == 128:
             window_rates.append(max(window.count(1), window.count(-1)) / 128)
     collapse_rate = max(window_rates) if window_rates else None
-    return {"games": n, "wins": wins, "draws": draws, "losses": losses, "score": score,
-            "paired_score_ci95": [max(0,mean-radius), min(1,mean+radius)],
-            "score_wilson_ci95": list(wilson), "wilson_lower": wilson[0],
-            "ci_method": "Hoeffding and score-Wilson intervals on independent seeded opening pairs",
-            "max_same_board_color_win_rate_128": collapse_rate,
-            "color_collapse_detected": collapse_rate > 0.85 if collapse_rate is not None else None,
-            "complete": n == expected,
-            "by_color": {str(c): {"wins": sum(r["result"] == 1 for r in results if r["color"] == c),
-                                   "draws": sum(r["result"] == 0 for r in results if r["color"] == c),
-                                   "losses": sum(r["result"] == -1 for r in results if r["color"] == c)} for c in (1,-1)}}
+    report = {"games": n, "wins": wins, "draws": draws, "losses": losses, "score": score,
+              "paired_score_ci95": [max(0,mean-radius), min(1,mean+radius)],
+              "score_wilson_ci95": list(wilson), "wilson_lower": wilson[0],
+              "ci_method": "Hoeffding and score-Wilson intervals on independent seeded opening pairs",
+              "max_same_board_color_win_rate_128": collapse_rate,
+              "color_collapse_detected": collapse_rate > 0.85 if collapse_rate is not None else None,
+              "complete": n == expected,
+              "by_color": {str(c): {"wins": sum(r["result"] == 1 for r in results if r["color"] == c),
+                                     "draws": sum(r["result"] == 0 for r in results if r["color"] == c),
+                                     "losses": sum(r["result"] == -1 for r in results if r["color"] == c)} for c in (1,-1)}}
+    statistics = search_statistics(results)
+    if statistics:
+        report["search_statistics"] = statistics
+    return report
 
 
 def _arena_actor(worker, tasks, requests, response, results, cancel, cfg):
@@ -89,8 +194,8 @@ def _arena_actor(worker, tasks, requests, response, results, cancel, cfg):
             task = tasks.get()
             if task is None:
                 return
-            pair, color, opening = task
-            game = opening.copy()
+            pair, color, start = task
+            game = start.copy()
             ours = MCTS(lambda state: evaluate(0, state), cfg["simulations"], cfg["cpuct"])
             theirs = MCTS(lambda state: evaluate(1, state), cfg["simulations"], cfg["cpuct"])
             try:
@@ -103,7 +208,7 @@ def _arena_actor(worker, tasks, requests, response, results, cancel, cfg):
             except SearchStopped:
                 return
             results.put(("game", pair, {"result": game.winner * color,
-                                         "color": color, "winner": game.winner}))
+                                         "color": color, "winner": game.winner, "pair": pair}))
     except BaseException:
         results.put(("error", worker, traceback.format_exc()))
 
@@ -118,9 +223,9 @@ def _batched_match(model, cfg, device, opponent, pairs, deadline, stop, sequenti
     for pair in range(pairs):
         # One shared, balanced opening per pair: both colours face the same
         # position, which is what makes the paired comparison meaningful.
-        opening = balanced_opening(cfg["rule"], 91823 + pair, cfg.get("opening_plies", 8))
+        start = balanced_opening(cfg["rule"], 91823 + pair, cfg.get("opening_plies", 8))
         for color in (1, -1):
-            tasks.put((pair, color, opening))
+            tasks.put((pair, color, start))
     for _ in replies:
         tasks.put(None)
     actors = [ctx.Process(target=_arena_actor,
@@ -213,18 +318,20 @@ def _batched_match(model, cfg, device, opponent, pairs, deadline, stop, sequenti
 
 
 def match(model, cfg, device, opponent, pairs, deadline=float("inf"), stop=lambda: False,
-          sequential=False):
+          sequential=False, client=None):
     if not isinstance(opponent, str) and cfg.get("workers", 1) > 1:
         return _batched_match(model, cfg, device, opponent, pairs, deadline, stop, sequential)
     results = []
     stopped = lambda: stop() or time.monotonic() >= deadline
+    mode = cfg.get("opening_mode", "sampled")
+    book = load_book(cfg)
     for pair in range(pairs):
-        opening = balanced_opening(cfg["rule"], 91823 + pair, cfg.get("opening_plies", 8))
+        start = opening(cfg["rule"], 91823 + pair, mode, cfg.get("opening_plies", 8), client, book=book)
         for color in (1,-1):
             if stopped():
                 return summary(results, pairs*2)
             rng = np.random.default_rng(4141+pair)
-            g = opening.copy()
+            g = start.copy()
             ours = MCTS(Evaluator(model, device), cfg["simulations"], cfg["cpuct"])
             theirs = MCTS(Evaluator(opponent, device), cfg["simulations"], cfg["cpuct"]) if not isinstance(opponent,str) else None
             try:
@@ -245,7 +352,8 @@ def match(model, cfg, device, opponent, pairs, deadline=float("inf"), stop=lambd
                         theirs.advance(a, g)
             except SearchStopped:
                 return summary(results, pairs*2)
-            results.append({"result": g.winner*color, "color": color, "winner": g.winner})
+            results.append({"result": g.winner*color, "color": color, "winner": g.winner,
+                            "pair": pair, "moves": list(g.history)})
             print(f"evaluation opponent={opponent if isinstance(opponent,str) else 'historical'} games={len(results)}/{pairs*2}", flush=True)
         if sequential:
             interim = summary(results, pairs * 2)
@@ -258,7 +366,7 @@ def match(model, cfg, device, opponent, pairs, deadline=float("inf"), stop=lambd
     return summary(results, pairs*2)
 
 
-def tactical_gate(model, cfg, device):
+def tactical_gate(model, cfg, device, mode="mcts"):
     positions = []
     for dr, dc in ((0, 1), (1, 0), (1, 1), (1, -1)):
         game = Game(cfg["rule"])
@@ -275,10 +383,17 @@ def tactical_gate(model, cfg, device):
     correct = 0
     evaluator = Evaluator(model, device)
     for game, accepted in positions:
-        action = int(np.argmax(MCTS(evaluator, max(1, min(8, cfg["simulations"])), cfg["cpuct"]).policy(game)))
+        if mode == "policy":
+            # A policy-only checkpoint has an untrained value head, so routing
+            # the gate through MCTS would test what was deliberately skipped.
+            action, _ = policy_move(game, evaluator, "forced")
+        else:
+            action = int(np.argmax(MCTS(evaluator, max(1, min(8, cfg["simulations"])),
+                                        cfg["cpuct"], candidates=cfg.get("candidates", "tactical")
+                                        ).policy(game)))
         correct += int(accepted[action])
     return {"correct": correct, "total": len(positions), "accuracy": correct / len(positions),
-            "passed": correct == len(positions)}
+            "mode": mode, "passed": correct == len(positions)}
 
 
 def evaluate_suite(model, cfg, device, root, pairs, deadline=float("inf"), stop=lambda: False):
@@ -301,24 +416,69 @@ def evaluate_suite(model, cfg, device, root, pairs, deadline=float("inf"), stop=
 
 def evaluate_rapfi(model, cfg, device, engine, engine_dir, pairs,
                    deadline=float("inf"), stop=lambda: False,
-                   threads=4, hash_mb=256, max_nodes=200_000, timeout=5.0):
+                   threads=4, hash_mb=256, max_nodes=200_000, timeout=5.0,
+                   opening_seed=91823, with_records=False):
     from .rapfi import RapfiClient
     results = []
+    search = cfg.get("search", "mcts")
+    candidates = cfg.get("candidates", "tactical")
+    mode = cfg.get("opening_mode", "sampled")
+    book = load_book(cfg)
     stopped = lambda: stop() or time.monotonic() >= deadline
-    with RapfiClient(engine, engine_dir, threads, hash_mb, max_nodes, timeout, 2) as rapfi:
+
+    def finish():
+        report = summary(results, pairs * 2)
+        report.update({"search_mode": search, "candidates": candidates, "opening_mode": mode,
+                       "opening_seed": opening_seed, "max_nodes": max_nodes,
+                       "opening_book": str(cfg.get("opening_book")) if book else None,
+                       "simulations": cfg["simulations"] if search == "mcts" else 0})
+        if with_records:
+            # Per-pair (pair, color) results are what `paired_delta` needs to
+            # compare two arms on identical openings; callers that only read the
+            # aggregate leave them out to keep the report small.
+            report["records"] = [{"pair": record["pair"], "color": record["color"],
+                                  "result": record["result"], "winner": record["winner"]}
+                                 for record in results]
+        return report
+
+    with RapfiClient(engine, engine_dir, threads, hash_mb, max_nodes, timeout, 2, rule="freestyle") as rapfi:
         for pair in range(pairs):
-            opening = balanced_opening("freestyle", 91823 + pair, cfg.get("opening_plies", 8))
+            start = opening("freestyle", opening_seed + pair, mode, cfg.get("opening_plies", 8),
+                            rapfi, book=book)
             for color in (1, -1):
                 if stopped():
-                    return summary(results, pairs * 2)
-                game, ours = opening.copy(), MCTS(Evaluator(model, device), cfg["simulations"], cfg["cpuct"])
+                    return finish()
+                game = start.copy()
+                evaluator = Evaluator(model, device)
+                tree = MCTS(evaluator, cfg["simulations"], cfg["cpuct"], candidates=candidates) \
+                    if search == "mcts" else None
+                moves_detail = []
                 while game.adjudicate() is None:
                     if stopped():
-                        return summary(results, pairs * 2)
-                    action = (int(np.argmax(ours.policy(game, stop=stopped))) if game.player == color
-                              else rapfi.analyze(game, 1).moves[0].action)
+                        return finish()
+                    if game.player == color:
+                        action = play_move(game, model, evaluator, cfg, search, candidates, tree, stopped)
+                        if tree is not None:
+                            stats = tree.last_stats
+                            moves_detail.append({"candidate_count": stats["candidate_count"],
+                                                 "candidate_mode": stats["candidate_mode"],
+                                                 "value_abs_mean": stats["value_abs_mean"],
+                                                 "search_prior_kl": stats["search_prior_kl"],
+                                                 "root_visited_moves": stats["root_visited_moves"],
+                                                 "root_max_visit_share": stats["root_max_visit_share"],
+                                                 "root_visit_entropy": stats["root_visit_entropy"],
+                                                 "mean_visits_per_visited_move":
+                                                     stats["mean_visits_per_visited_move"]})
+                        else:
+                            moves_detail.append({"candidate_mode": "policy_only"})
+                    else:
+                        action = rapfi.analyze(game, 1).moves[0].action
                     game.move(action)
-                    ours.advance(action, game)
-                results.append({"result": game.winner * color, "color": color, "winner": game.winner})
-                print(f"evaluation opponent=rapfi games={len(results)}/{pairs * 2}", flush=True)
-    return summary(results, pairs * 2)
+                    if tree is not None:
+                        tree.advance(action, game)
+                results.append({"result": game.winner * color, "color": color,
+                                "winner": game.winner, "pair": pair,
+                                "moves": list(game.history), "moves_detail": moves_detail})
+                print(f"evaluation opponent=rapfi search={search} candidates={candidates} "
+                      f"games={len(results)}/{pairs * 2}", flush=True)
+    return finish()

@@ -46,6 +46,7 @@ def test_small_teacher_generation_is_safe_and_exact(tmp_path):
                                         retries=0, shard_size=4)
     assert manifest["positions_written"] == 6
     assert manifest["rapfi_version"] == "dataset-fake"
+    assert manifest["format_version"] == 3
     assert {item["path"] for item in manifest["engine_files"]} == {"config.toml", "weights.bin"}
     shards = list(output.rglob("*.npz"))
     assert shards
@@ -53,10 +54,16 @@ def test_small_teacher_generation_is_safe_and_exact(tmp_path):
         assert shard["state"].dtype == np.uint8 and shard["state"].shape[1:] == (3, 15, 15)
         assert shard["policy"].dtype == np.float16 and shard["policy"].shape[1] == 225
         assert len(shard["state"]) <= 4
+        # The stored per-action winrates must be the engine's raw numbers, not
+        # the softmax-of-odds values the policy target is built from.
+        assert shard["teacher_topk_winrates"].dtype == np.float16
+        assert np.allclose(shard["teacher_topk_winrates"][0].astype(np.float64),
+                           [0.8, 0.7, 0.6, 0.5, 0.4], atol=1e-3)
+        assert not np.isclose(shard["policy"][0].max(), 0.8)
 
 
 def make_dataset(root, rows=64):
-    manifest = {"format": "renju-rapfi-teacher-npz", "format_version": 2,
+    manifest = {"format": "renju-rapfi-teacher-npz", "format_version": 3,
                 "rule": "freestyle", "seed": 1}
     root.mkdir()
     (root / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
@@ -65,6 +72,10 @@ def make_dataset(root, rows=64):
     policy = np.zeros((rows, 225), np.float16)
     policy[:, 112] = 1
     values = np.zeros(rows, np.float16)
+    topk_actions = np.full((rows, 5), 255, np.uint8)
+    topk_actions[:, 0] = 112
+    topk_winrates = np.full((rows, 5), np.nan, np.float16)
+    topk_winrates[:, 0] = 0.6
     for split in ("train", "validation", "test"):
         folder = root / split
         folder.mkdir()
@@ -72,7 +83,9 @@ def make_dataset(root, rows=64):
                             value=values, game_id=np.arange(rows, dtype=np.uint32),
                             ply=np.zeros(rows, np.uint16),
                             teacher_best=np.full(rows, 112, np.uint16),
-                            teacher_nodes=np.full(rows, 100, np.uint64))
+                            teacher_nodes=np.full(rows, 100, np.uint64),
+                            teacher_topk_actions=topk_actions,
+                            teacher_topk_winrates=topk_winrates)
 
 
 def test_64_sample_overfit_save_and_weight_only_init(tmp_path, monkeypatch):

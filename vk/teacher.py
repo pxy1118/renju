@@ -1,26 +1,19 @@
 """Rapfi teacher-game generation and safe, sharded NPZ storage."""
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-import hashlib
 import json
-import math
 import threading
 import time
 import numpy as np
 
 from .candidates import tactical_candidates
+from .datasets import (FORMAT_VERSION, LEGACY_ACTION, TOPK_FIELDS, TOPK_SLOTS,
+                       ShardWriter, _split as split_for_game, sha256, symmetry)
 from .game import Game
 from .rapfi import RapfiClient, RapfiError
 
-FORMAT_VERSION = 2
-
-
-def symmetry(array, index):
-    """One of the eight D4 transforms over the final two dimensions."""
-    result = np.rot90(array, index % 4, axes=(-2, -1))
-    if index >= 4:
-        result = result[..., ::-1]
-    return result.copy()
+__all__ = ["FORMAT_VERSION", "ShardWriter", "canonical_key", "generate_teacher_dataset",
+           "sha256", "symmetry", "teacher_policy", "teacher_winrates"]
 
 
 def canonical_key(game):
@@ -28,10 +21,26 @@ def canonical_key(game):
     return min(symmetry(board, index).tobytes() for index in range(8)) + bytes((game.player + 1,))
 
 
-def teacher_policy(game, moves):
+def teacher_winrates(moves):
+    """Raw Rapfi winrate of every analysed move, in the order Rapfi ranked them.
+
+    These are probabilities from the side to move's perspective, exactly as the
+    engine reported them. They are what a *cost* measurement must use: the
+    stored ``policy`` vector is the softmax of their odds transform, which is a
+    distribution over moves and only looks like a winrate by coincidence.
+    """
     if not moves:
         raise ValueError("Teacher returned no moves")
-    probabilities = np.array([min(1 - 1e-6, max(1e-6, move.winrate)) for move in moves], np.float64)
+    return np.array([min(1 - 1e-6, max(1e-6, move.winrate)) for move in moves], np.float64)
+
+
+def teacher_policy(game, moves):
+    """Distribution matching target: odds-softmax of the winrates, 98/2 mixed.
+
+    Kept bit-compatible with the data generated before format 3, so a change in
+    this formula would silently make the two datasets incomparable.
+    """
+    probabilities = teacher_winrates(moves)
     logits = np.log(probabilities) - np.log1p(-probabilities)
     weights = np.exp(logits - logits.max())
     weights /= weights.sum()
@@ -44,48 +53,14 @@ def teacher_policy(game, moves):
     return target.astype(np.float16)
 
 
-def sha256(path):
-    digest = hashlib.sha256()
-    with Path(path).open("rb") as source:
-        for chunk in iter(lambda: source.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-class ShardWriter:
-    def __init__(self, root, shard_size=4096):
-        self.root, self.shard_size = Path(root), int(shard_size)
-        self.buffers = {split: [] for split in ("train", "validation", "test")}
-        self.counts = {split: 0 for split in self.buffers}
-        self.shards = {split: 0 for split in self.buffers}
-        for split in self.buffers:
-            (self.root / split).mkdir(parents=True, exist_ok=True)
-
-    def add(self, split, record):
-        self.buffers[split].append(record)
-        if len(self.buffers[split]) >= self.shard_size:
-            self.flush(split)
-
-    def flush(self, split):
-        records = self.buffers[split]
-        if not records:
-            return
-        names = ("state", "policy", "value", "game_id", "ply", "teacher_best", "teacher_nodes")
-        arrays = {name: np.stack([record[name] for record in records]) for name in names}
-        path = self.root / split / f"shard-{self.shards[split]:05d}.npz"
-        np.savez_compressed(path, **arrays)
-        self.counts[split] += len(records)
-        self.shards[split] += 1
-        records.clear()
-
-    def close(self):
-        for split in self.buffers:
-            self.flush(split)
-
-
-def _split(game_id):
-    bucket = int(game_id) % 10
-    return "train" if bucket < 8 else "validation" if bucket == 8 else "test"
+def topk_slots(moves):
+    """`(actions, winrates)` arrays of ``TOPK_SLOTS`` entries, sentinel padded."""
+    actions = np.full(TOPK_SLOTS, LEGACY_ACTION, np.uint8)
+    winrates = np.full(TOPK_SLOTS, np.nan, np.float16)
+    for index, move in enumerate(moves[:TOPK_SLOTS]):
+        actions[index] = move.action
+        winrates[index] = move.winrate
+    return actions, winrates
 
 
 def _play_teacher_game(client, game_id, seed, sample_plies, rule="freestyle"):
@@ -102,11 +77,13 @@ def _play_teacher_game(client, game_id, seed, sample_plies, rule="freestyle"):
         analysis = client.analyze(game, 5)
         target = teacher_policy(game, analysis.moves)
         best = analysis.moves[0]
+        topk_actions, topk_winrates = topk_slots(analysis.moves)
         records.append({
             "state": game.encode().astype(np.uint8), "policy": target,
             "value": np.float16(2 * best.winrate - 1), "game_id": np.uint32(game_id),
             "ply": np.uint16(np.count_nonzero(game.board)), "teacher_best": np.uint16(best.action),
             "teacher_nodes": np.uint64(best.nodes),
+            "teacher_topk_actions": topk_actions, "teacher_topk_winrates": topk_winrates,
         })
         if np.count_nonzero(game.board) < sample_plies:
             probabilities = np.zeros(225, np.float64)
@@ -145,6 +122,8 @@ def generate_teacher_dataset(engine, engine_dir, output, positions=50_000, worke
     audit_pairs = 0
     audit_sum_same = 0.0
     audit_sum_negated = 0.0
+    audit_top1_pairs = 0
+    audit_top1_error = 0.0
     started = time.monotonic()
     try:
         with ThreadPoolExecutor(max_workers=workers) as pool:
@@ -165,9 +144,17 @@ def generate_teacher_dataset(engine, engine_dir, output, positions=50_000, worke
                         audit_pairs += 1
                         audit_sum_same += abs(left_value - right_value)
                         audit_sum_negated += abs(left_value + right_value)
+                        # Only rows where the teacher actually followed its own top-1
+                        # one ply deeper can be checked against 1 - W(parent top-1):
+                        # inside the sampling window the played move may be another
+                        # analysed move, and then the child describes a different line.
+                        if int(right["teacher_topk_actions"][0]) != int(left["teacher_best"]):
+                            continue
+                        audit_top1_pairs += 1
+                        audit_top1_error += abs(1.0 - float(right["teacher_topk_winrates"][0]))
                     if sum(writer.counts.values()) + sum(map(len, writer.buffers.values())) >= positions:
                         continue
-                    split = _split(gid)
+                    split = split_for_game(gid)
                     for record in records:
                         player = 1 if bool(record["state"][2, 0, 0]) else -1
                         board = np.where(record["state"][0], player,
@@ -204,9 +191,18 @@ def generate_teacher_dataset(engine, engine_dir, output, positions=50_000, worke
         "format": "renju-rapfi-teacher-npz", "format_version": FORMAT_VERSION,
         "rule": rule, "seed": seed, "positions_requested": positions,
         "positions_written": sum(writer.counts.values()), "games_attempted": game_id,
-        "failed_games": failures, "split": "game_id modulo 10: 0-7/8/9",
+        "failed_games": failures, "split": "game_id modulo 10: 0-7 train / 8 validation / 9 test",
         "counts": writer.counts, "shards": writer.shards, "shard_size": shard_size,
         "augmentation": "D4 at training time only",
+        "topk": TOPK_SLOTS,
+        "policy_semantics": ("policy[i] is the softmax of the odds transform of the Rapfi "
+                             "winrates, normalised over the analysed moves and 98/2 mixed "
+                             "with the local candidate set. It is a distribution over moves, "
+                             "NOT a winrate; never read it as P(win) for move i."),
+        "winrate_semantics": (f"{TOPK_FIELDS[0]}/{TOPK_FIELDS[1]} hold the raw Rapfi MultiPV "
+                              "winrates from the side-to-move perspective, in analysis order. "
+                              f"Slots are {int(LEGACY_ACTION)}/NaN when fewer than {TOPK_SLOTS} "
+                              "moves were analysed."),
         "rapfi_version": next((item.version for item in clients if item.version != "unknown"), "unknown"),
         "engine": {"path": str(engine_path), "sha256": sha256(engine_path)},
         "engine_files": [{"path": str(path.relative_to(engine_dir)), "sha256": sha256(path)}
@@ -217,6 +213,13 @@ def generate_teacher_dataset(engine, engine_dir, output, positions=50_000, worke
                        "yxboard_roles": "1=current player, 2=opponent",
                        "policy_mix": {"teacher": 0.98, "local_candidates": 0.02}},
         "value_perspective_audit": perspective_audit,
+        "top1_consistency": {"pairs": audit_top1_pairs,
+                             "mean_abs_one_minus_next_top1": audit_top1_error / audit_top1_pairs
+                             if audit_top1_pairs else None,
+                             "note": "Rapfi is not a fixed-depth solver: 1 - W(parent top1) need "
+                                     "not equal W(child top1). A large value means the winrates "
+                                     "are noisy across sibling positions, which weakens any "
+                                     "single-position cost argument."},
         "elapsed_seconds": time.monotonic() - started,
     }
     (output / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")

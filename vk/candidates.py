@@ -88,6 +88,45 @@ def tacticals(game):
     return immediate_wins(game, -game.player) & legal
 
 
+def legal_candidates(game):
+    """Every legal placement; no tactical pruning at all."""
+    return CandidateSet(game.legal(), "all_legal")
+
+
+def forced_candidates(game):
+    """Only the moves whose value is *determined*, with no heuristic pruning.
+
+    Three cases: complete a five, block the opponent's five, or nothing is
+    determined and every legal point is offered. ``four_threats`` is
+    deliberately absent -- a forcing four is strong, not forced, and letting it
+    choose the action set is exactly what excluded 5.43% of Rapfi's best moves
+    and made a whole class of positions unwinnable.
+    """
+    own = immediate_wins(game)
+    if own.any():
+        return CandidateSet(own, "forced_win")
+    defences = tacticals(game)
+    if defences.any():
+        return CandidateSet(defences, "forced_defense")
+    return legal_candidates(game)
+
+
+def candidate_mask(game, mode="tactical"):
+    """Candidate set for one search mode.
+
+    ``tactical`` keeps the historical ``square3_line4`` pruning, ``forced``
+    keeps only the deterministic rules, ``legal`` keeps everything.
+    """
+    if mode == "tactical":
+        return tactical_candidates(game)
+    if mode == "forced":
+        return forced_candidates(game)
+    if mode == "legal":
+        return legal_candidates(game)
+    raise ValueError(f"Unknown candidate mode: {mode!r} "
+                     f"(known: ['tactical', 'forced', 'legal'])")
+
+
 def tactical_candidates(game):
     """Rapfi-inspired, symmetry-equivariant candidate set for one node."""
     legal = game.legal()

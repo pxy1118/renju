@@ -1,7 +1,8 @@
 import numpy as np
 import pytest
 
-from vk.candidates import four_threats, immediate_wins, tactical_candidates
+from vk.candidates import (candidate_mask, forced_candidates, four_threats,
+                           immediate_wins, legal_candidates, tactical_candidates)
 from vk.game import Game
 from vk.teacher import symmetry
 
@@ -152,3 +153,52 @@ def test_immediate_win_outranks_a_forcing_four():
     assert immediate_wins(game).any()
     assert not four_threats(game).any()
     assert tactical_candidates(game).mode == "forced_win"
+
+
+def test_forced_candidates_keep_every_legal_move_when_nothing_is_forced():
+    """A forcing three is strong, not forced: it must not choose the action set."""
+    game = place([(7, 5), (7, 6), (7, 7)])
+    assert four_threats(game).any()
+    assert tactical_candidates(game).mode == "strategic"
+    result = forced_candidates(game)
+    assert result.mode == "all_legal"
+    assert np.array_equal(result.mask, game.legal())
+
+
+def test_forced_candidates_only_keep_determined_moves():
+    win = place([(7, 5), (7, 6), (7, 7), (7, 8)])
+    result = forced_candidates(win)
+    assert result.mode == "forced_win"
+    assert np.array_equal(np.flatnonzero(result.mask), np.flatnonzero(immediate_wins(win)))
+
+    defence = Game()
+    defence.board[105:109] = -1
+    result = forced_candidates(defence)
+    assert result.mode == "forced_defense"
+    assert np.array_equal(result.mask, tactical_candidates(defence).mask)
+
+    empty = forced_candidates(Game())
+    assert empty.mode == "all_legal" and int(empty.mask.sum()) == 225
+    # Under Renju the empty board is not "unconstrained": the centre is forced
+    # by the rule, so even the unpruned mode offers exactly one point.
+    renju = forced_candidates(Game("renju"))
+    assert renju.mode == "all_legal"
+    assert np.flatnonzero(renju.mask).tolist() == [112]
+
+
+def test_candidate_mask_selects_the_mode_and_rejects_typos():
+    game = place([(7, 5), (7, 6), (7, 7)])
+    assert candidate_mask(game, "tactical").mode == "strategic"
+    assert candidate_mask(game, "forced").mode == "all_legal"
+    assert candidate_mask(game, "legal").mode == "all_legal"
+    assert np.array_equal(candidate_mask(game, "legal").mask, game.legal())
+    with pytest.raises(ValueError, match="Unknown candidate mode"):
+        candidate_mask(game, "square3")
+
+
+def test_legal_candidates_offer_every_empty_point():
+    game = place([(7, 7), (8, 8)])
+    result = legal_candidates(game)
+    assert result.mode == "all_legal"
+    assert int(result.mask.sum()) == 223
+    assert not result.mask[7 * 15 + 7] and not result.mask[8 * 15 + 8]
