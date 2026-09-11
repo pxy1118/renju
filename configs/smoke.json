@@ -1,5 +1,6 @@
 {
-  "channels": 16,
+  "arch": "hybrid-8-1",
+  "channels": 8,
   "blocks": 1,
   "simulations": 4,
   "workers": 2,

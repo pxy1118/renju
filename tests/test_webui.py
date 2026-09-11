@@ -44,8 +44,8 @@ def wait_state(state_of):
 def models(tmp_path):
     torch.set_num_threads(1)
     for rule in ("freestyle", "renju"):
-        cfg = dict(DEFAULTS, rule=rule, channels=4, blocks=1)
-        atomic_save(dict(format=1, config=cfg, model=Network(4, 1).state_dict(), step=7),
+        cfg = dict(DEFAULTS,rule=rule,arch="hybrid-8-1",channels=8,blocks=1)
+        atomic_save(dict(format=1, config=cfg, model=Network("hybrid-8-1").state_dict(), step=7),
                     tmp_path / rule / "checkpoint-00000001.pt")
     return tmp_path
 
@@ -85,8 +85,8 @@ def test_explicit_checkpoint_selection(models):
     """A named historical checkpoint can be replayed, not only latest/best."""
     import time
     for round_id in (2, 3):
-        atomic_save(dict(format=1, config=dict(DEFAULTS, rule="freestyle", channels=4, blocks=1),
-                         model=Network(4, 1).state_dict(), step=round_id * 100),
+        atomic_save(dict(format=1, config=dict(DEFAULTS, rule="freestyle", arch="hybrid-8-1", channels=8, blocks=1),
+                         model=Network("hybrid-8-1").state_dict(), step=round_id * 100),
                     models / "freestyle" / f"checkpoint-{round_id:08d}.pt")
         time.sleep(0.01)
     table = Table(models)
@@ -113,8 +113,8 @@ def test_explicit_checkpoint_selection(models):
 
 def test_discovers_and_loads_pretrain_and_hybrid_directories(models):
     pretrain = models / "freestyle-pretrain-v2"
-    state = dict(format=1, config=dict(DEFAULTS, rule="freestyle", channels=4, blocks=1),
-                 model=Network(4, 1).state_dict(), step=20000)
+    state = dict(format=1, config=dict(DEFAULTS, rule="freestyle", arch="hybrid-8-1", channels=8, blocks=1),
+                 model=Network("hybrid-8-1").state_dict(), step=20000)
     atomic_save(state, pretrain / "best.pt")
     table = Table(models)
     try:

@@ -6,7 +6,8 @@ import time
 import traceback
 import numpy as np
 from .game import Game, lengths
-from .network import Network, Evaluator
+from .network import Network, Evaluator, architecture_of
+from .openings import balanced_opening
 from .search import MCTS, SearchStopped
 from .training import load_checkpoint
 from .candidates import immediate_wins, tactical_candidates
@@ -115,10 +116,9 @@ def _batched_match(model, cfg, device, opponent, pairs, deadline, stop, sequenti
     worker_count = min(cfg.get("workers", 1), pairs * 2)
     replies = [ctx.Queue() for _ in range(worker_count)]
     for pair in range(pairs):
-        opening_rng = np.random.default_rng(91823 + pair)
-        opening = Game(cfg["rule"])
-        for _ in range(4):
-            opening.move(int(opening_rng.choice(np.flatnonzero(opening.legal()))), validate=False)
+        # One shared, balanced opening per pair: both colours face the same
+        # position, which is what makes the paired comparison meaningful.
+        opening = balanced_opening(cfg["rule"], 91823 + pair, cfg.get("opening_plies", 8))
         for color in (1, -1):
             tasks.put((pair, color, opening))
     for _ in replies:
@@ -219,10 +219,7 @@ def match(model, cfg, device, opponent, pairs, deadline=float("inf"), stop=lambd
     results = []
     stopped = lambda: stop() or time.monotonic() >= deadline
     for pair in range(pairs):
-        opening_rng = np.random.default_rng(91823+pair)
-        opening = Game(cfg["rule"])
-        for _ in range(4):
-            opening.move(int(opening_rng.choice(np.flatnonzero(opening.legal()))), validate=False)
+        opening = balanced_opening(cfg["rule"], 91823 + pair, cfg.get("opening_plies", 8))
         for color in (1,-1):
             if stopped():
                 return summary(results, pairs*2)
@@ -291,7 +288,7 @@ def evaluate_suite(model, cfg, device, root, pairs, deadline=float("inf"), stop=
     opponents = []
     if best.exists():
         state = load_checkpoint(best, cfg["rule"])
-        other = Network(state["config"]["channels"], state["config"]["blocks"]).to(device)
+        other = Network(architecture_of(state["config"])).to(device)
         other.load_state_dict(state["model"])
         opponents.append(("historical", other))
     opponents.extend([("random", "random"), ("tactical", "tactical")])
@@ -310,10 +307,7 @@ def evaluate_rapfi(model, cfg, device, engine, engine_dir, pairs,
     stopped = lambda: stop() or time.monotonic() >= deadline
     with RapfiClient(engine, engine_dir, threads, hash_mb, max_nodes, timeout, 2) as rapfi:
         for pair in range(pairs):
-            opening = Game("freestyle")
-            opening_rng = np.random.default_rng(91823 + pair)
-            for _ in range(4):
-                opening.move(int(opening_rng.choice(np.flatnonzero(opening.legal()))))
+            opening = balanced_opening("freestyle", 91823 + pair, cfg.get("opening_plies", 8))
             for color in (1, -1):
                 if stopped():
                     return summary(results, pairs * 2)

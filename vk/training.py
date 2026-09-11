@@ -7,14 +7,20 @@ import copy
 from collections import deque
 import numpy as np
 import torch
-from .network import Network, Evaluator
+from .network import DEFAULT_ARCH, Network, Evaluator, architecture_of
 from .selfplay import collect
 
-DEFAULTS = dict(rule="freestyle", channels=64, blocks=6, simulations=200, cpuct=2.0,
+DEFAULTS = dict(rule="freestyle", arch=DEFAULT_ARCH, channels=128, blocks=10,
+                simulations=200, cpuct=2.0,
                 temperature_moves=20, workers=16, games_per_round=32, train_steps=200,
                 replay_capacity=100000, batch_size=256, learning_rate=0.001,
                 weight_decay=0.0001, seed=20260910, eval_every=10, eval_pairs=10,
-                min_replay_size=1, promotion_every=10, promotion_pairs=10)
+                min_replay_size=1, promotion_every=10, promotion_pairs=10,
+                opening_plies=8)
+
+# Fields a resume may legitimately change: both describe how data is gathered
+# in this process, not what the stored model and optimizer mean.
+RESUME_FREE_FIELDS = {"workers", "opening_plies"}
 
 
 def augment(x, pi, rotation, mirror):
@@ -144,22 +150,27 @@ def train(cfg, root, device, seconds, resume=None, stop=lambda: False, max_round
     if state:
         if "optimizer" not in state:
             raise ValueError("Inference-only best checkpoint cannot resume training; use latest.")
-        changed = {key for key in set(cfg) | set(state["config"])
-                   if cfg.get(key) != state["config"].get(key)}
-        incompatible = changed - {"workers"}
+        # Older checkpoints predate fields added to DEFAULTS since; compare them
+        # at their current default rather than reporting a spurious mismatch.
+        stored = {key: state["config"].get(key, value) for key, value in DEFAULTS.items()}
+        stored.update({key: value for key, value in state["config"].items()
+                       if key not in DEFAULTS})
+        stored["arch"] = architecture_of(state["config"])
+        changed = {key for key in set(cfg) | set(stored) if cfg.get(key) != stored.get(key)}
+        incompatible = changed - RESUME_FREE_FIELDS
         if incompatible:
             raise ValueError(f"Resume configuration differs in incompatible fields: {sorted(incompatible)}")
     random.seed(cfg["seed"])
     torch.manual_seed(cfg["seed"])
     rng = np.random.default_rng(cfg["seed"])
-    model = Network(cfg["channels"], cfg["blocks"]).to(device)
+    model = Network(cfg["arch"]).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=cfg["learning_rate"], weight_decay=cfg["weight_decay"])
     replay = deque(maxlen=cfg["replay_capacity"])
     round_id = step = total_games = pending_steps = 0
     teacher = None
     if init_checkpoint:
         initial = load_checkpoint(checkpoint_path(root, init_checkpoint), cfg["rule"])
-        if initial["config"]["channels"] != cfg["channels"] or initial["config"]["blocks"] != cfg["blocks"]:
+        if architecture_of(initial["config"]) != cfg["arch"]:
             raise ValueError("Initial checkpoint architecture mismatch")
         if initial.get("pretrain_report") and not initial["pretrain_report"].get("accepted"):
             raise ValueError("Initial pretraining checkpoint did not pass the formal acceptance gates")
@@ -190,12 +201,13 @@ def train(cfg, root, device, seconds, resume=None, stop=lambda: False, max_round
         champion_state = copy.deepcopy(model.state_dict())
         champion_optimizer = copy.deepcopy(optimizer.state_dict())
         champion_step = step
-    champion = Network(cfg["channels"], cfg["blocks"]).to(device)
+    champion = Network(cfg["arch"]).to(device)
     champion.load_state_dict(champion_state)
     (root / "config.json").write_text(json.dumps(cfg, indent=2), encoding="utf-8")
     start = time.monotonic()
     deadline = start + seconds
     evaluator = Evaluator(champion, device)
+    minimum = cfg.get("min_replay_size", 1)
     if not (root / "best.pt").exists():
         atomic_save({"format": 1, "config": cfg, "model": champion_state,
                      "step": champion_step, "teacher": teacher,
@@ -217,10 +229,11 @@ def train(cfg, root, device, seconds, resume=None, stop=lambda: False, max_round
             total_games += len(games)
             for game in games:
                 append_json(root / "games.jsonl", {"round": round_id, **game})
-            pending_steps = cfg["train_steps"] if games and len(replay) >= cfg.get("min_replay_size", 1) else 0
+            pending_steps = cfg["train_steps"] if games and len(replay) >= minimum else 0
+        trainable = len(replay) >= minimum
         metrics = {}
         updates = 0
-        if len(replay) >= cfg.get("min_replay_size", 1):
+        if trainable:
             for _ in range(pending_steps):
                 if stop() or time.monotonic() >= deadline:
                     break
@@ -255,8 +268,15 @@ def train(cfg, root, device, seconds, resume=None, stop=lambda: False, max_round
         def average(name):
             values = [game.get(name) for game in games if game.get(name) is not None]
             return float(np.mean(values)) if values else None
+        # Opening length is the number of moves that preceded search, i.e. what
+        # balanced_opening supplied. Samples cover only the searched moves.
+        openings = [len(game["opening"]) for game in games if game.get("opening") is not None]
+        mean_opening = float(np.mean(openings)) if openings else None
         record = {"round": round_id, "step": step, "updates": updates, "games": len(games),
                   "total_games": total_games, "replay_size": len(replay), "pending_steps":pending_steps,
+                  "trainable": trainable, "min_replay_size": minimum,
+                  "opening_distinct": len({tuple(g["opening"]) for g in games if g.get("opening")}),
+                  "opening_sample_size": mean_opening,
                   "elapsed_seconds": time.monotonic()-start, "remaining_seconds": max(0,deadline-time.monotonic()),
                   "black_wins": sum(g["winner"] == 1 for g in games),
                   "white_wins": sum(g["winner"] == -1 for g in games),
@@ -267,6 +287,7 @@ def train(cfg, root, device, seconds, resume=None, stop=lambda: False, max_round
                   "candidate_count_mean": average("candidate_count_mean"),
                   "forced_win_count": sum(g.get("forced_win_count", 0) for g in games),
                   "forced_defense_count": sum(g.get("forced_defense_count", 0) for g in games),
+                  "strategic_count": sum(g.get("strategic_count", 0) for g in games),
                   "search_max_depth": max((g.get("search_max_depth", 0) for g in games), default=0),
                   "search_prior_kl_mean": average("search_prior_kl_mean"),
                   "value_abs_mean": average("value_abs_mean"),

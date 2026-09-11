@@ -1,6 +1,8 @@
 {
-  "channels": 64,
-  "blocks": 6,
+  "rule": "freestyle",
+  "arch": "hybrid-128-10",
+  "channels": 128,
+  "blocks": 10,
   "simulations": 400,
   "cpuct": 2.0,
   "temperature_moves": 20,
@@ -14,7 +16,8 @@
   "seed": 20260910,
   "eval_every": 5,
   "eval_pairs": 100,
-  "min_replay_size": 20000,
+  "min_replay_size": 256,
   "promotion_every": 5,
-  "promotion_pairs": 100
+  "promotion_pairs": 100,
+  "opening_plies": 8
 }

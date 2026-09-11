@@ -26,7 +26,7 @@ import numpy as np
 import torch
 
 from .game import Game
-from .network import Network, Evaluator
+from .network import Network, Evaluator, architecture_of
 from .search import MCTS
 from .training import load_checkpoint
 from .tunnel import Tunnel, TunnelError
@@ -38,9 +38,10 @@ RECENT_LIMIT = 8
 CHECKPOINT_HELP = "请让训练保存检查点后再试（每轮结束时写入）。"
 # Concurrent guest tables. Each one holds its own network and MCTS tree, so the
 # cap bounds the service's memory and CPU rather than being a nicety: measured
-# at roughly 16-30 MB per table with a game in progress (network weights are
-# only ~2 MB; the search tree dominates), so ten tables cost a few hundred MB.
-# CPU contention between ten concurrent searches is the binding constraint.
+# at roughly 16-30 MB per table with a game in progress under the legacy 64x6
+# network (weights ~2 MB; the search tree dominated). The hybrid 128x10 network
+# carries about 2.8 M parameters (~11 MB), which shifts that figure but leaves
+# the search tree and CPU contention as the binding constraints.
 LAN_SESSION_LIMIT = 10
 ALL_INTERFACES = "0.0.0.0"
 SESSION_COOKIE = "renju_session"
@@ -309,7 +310,7 @@ class Table:
                 raise FileNotFoundError(checkpoint)
             state = load_checkpoint(path, rule)
             cfg = state["config"]
-            model = Network(cfg["channels"], cfg["blocks"])
+            model = Network(architecture_of(cfg))
             model.load_state_dict(state["model"])
             self.tree = MCTS(Evaluator(model, "cpu"), simulations, cfg["cpuct"])
             with self.lock:

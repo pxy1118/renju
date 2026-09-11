@@ -11,7 +11,13 @@ SIZE = 15
 DIRECTIONS = ((1, 0), (0, 1), (1, 1), (1, -1))
 
 
-def line(board, point, direction):
+def line(point, direction):
+    """Board points through ``point`` along ``direction``, clipped to the board.
+
+    The board is deliberately not a parameter: the geometry does not depend on
+    it, and taking one only invites callers to pass their real board while
+    silently having it ignored.
+    """
     return _line(int(point),direction)
 
 
@@ -38,7 +44,7 @@ def lengths(board, point, color):
 
 
 def fours(board, point, direction):
-    cells = line(board, point, direction)
+    cells = line(point, direction)
     groups = {}
     center = cells.index(point)
     for start in range(max(0,center-4),min(center,len(cells)-5)+1):
@@ -71,7 +77,7 @@ def forbidden(position: bytes, point: int):
         return "double_four"
     threes = set()
     for d in DIRECTIONS:
-        cells = line(b, point, d)
+        cells = line(point, d)
         center = cells.index(point)
         nearby = cells[max(0,center-3):center+4]
         if sum(b[x] == 1 for x in nearby) < 3:

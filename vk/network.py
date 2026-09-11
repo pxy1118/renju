@@ -1,6 +1,62 @@
+"""Residual + Transformer hybrid network, selected by architecture name.
+
+``ARCHITECTURES`` is the single source of truth for every layout: a width plus a
+block pattern string of ``R`` (residual) and ``T`` (transformer) characters. The
+block count and the number of transformer blocks are derived from the pattern,
+so a name and the layers actually built can never disagree.
+
+``legacy-64-6`` reproduces the original all-convolutional network exactly, down
+to its parameter names, so checkpoints written before the hybrid existed still
+load. It is versioned by that contract: do not "improve" it, add a new entry.
+"""
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch import nn
+
+SIZE = 15
+POINTS = SIZE * SIZE
+PLANES = 3
+HEADS = 8
+HEAD_DIM = 16
+MLP_RATIO = 4
+DROPOUT = 0.0
+SPAN = 2 * SIZE - 1          # relative offsets run from -(SIZE-1) to +(SIZE-1)
+LEGACY_ARCH = "legacy-64-6"
+
+ARCHITECTURES = {
+    # 7 residual blocks and 3 transformer blocks, in the order given.
+    "hybrid-128-10": dict(width=128, pattern="RRTRRTRRTR", hybrid=True),
+    # The original network: plain residual stack, kept bit-compatible with the
+    # checkpoints it produced (same parameter names, same value head).
+    LEGACY_ARCH: dict(width=64, pattern="RRRRRR", hybrid=False),
+    # Small hybrid layouts for tests and for a cheap end-to-end smoke run.
+    "hybrid-64-3": dict(width=64, pattern="RTR", hybrid=True),
+    "hybrid-8-1": dict(width=8, pattern="R", hybrid=True),
+}
+DEFAULT_ARCH = "hybrid-128-10"
+
+
+def architecture(name):
+    """Resolve an architecture name to its width, block pattern and family."""
+    try:
+        entry = ARCHITECTURES[name]
+    except KeyError:
+        raise ValueError(f"Unknown architecture: {name!r} "
+                         f"(known: {sorted(ARCHITECTURES)})") from None
+    pattern = entry["pattern"]
+    if not pattern or set(pattern) - {"R", "T"}:
+        raise ValueError(f"Invalid block pattern for {name!r}: {pattern!r}")
+    return entry["width"], pattern, entry["hybrid"]
+
+
+def heads_for(width):
+    """As many 16-wide heads as the width allows, at least one."""
+    return max(1, min(HEADS, width // HEAD_DIM))
+
+
+def parameter_count(model):
+    return sum(parameter.numel() for parameter in model.parameters())
 
 
 class Residual(nn.Module):
@@ -15,19 +71,140 @@ class Residual(nn.Module):
         return torch.relu(x + self.body(x))
 
 
-class Network(nn.Module):
-    def __init__(self, channels=64, blocks=6):
+class TransformerBlock(nn.Module):
+    """Pre-LN transformer over the 225 board points, with a 2D relative bias.
+
+    There is no CLS token: the tokens *are* the board points, so the policy head
+    can keep reading per-point features from the same grid shape.
+    """
+    def __init__(self, channels, heads, mlp_ratio=MLP_RATIO, dropout=DROPOUT):
         super().__init__()
-        self.trunk = nn.Sequential(nn.Conv2d(3, channels, 3, padding=1, bias=False),
-                                   nn.BatchNorm2d(channels), nn.ReLU(),
-                                   *[Residual(channels) for _ in range(blocks)])
-        self.policy = nn.Sequential(nn.Conv2d(channels, 2, 1), nn.ReLU(), nn.Flatten(), nn.Linear(450, 225))
-        self.value = nn.Sequential(nn.Conv2d(channels, 1, 1), nn.ReLU(), nn.Flatten(),
-                                   nn.Linear(225, 64), nn.ReLU(), nn.Linear(64, 1), nn.Tanh())
+        self.channels, self.heads = channels, heads
+        self.dim = channels // heads
+        self.ln1, self.ln2 = nn.LayerNorm(channels), nn.LayerNorm(channels)
+        self.qkv = nn.Linear(channels, 3 * channels)
+        self.proj = nn.Linear(channels, channels)
+        hidden = channels * mlp_ratio
+        self.mlp = nn.Sequential(nn.Linear(channels, hidden), nn.GELU(),
+                                 nn.Dropout(dropout), nn.Linear(hidden, channels),
+                                 nn.Dropout(dropout))
+        # One table per head, indexed by (drow + SIZE-1) * SPAN + (dcol + SIZE-1).
+        self.bias = nn.Parameter(torch.zeros(heads, SPAN * SPAN))
+        rows, cols = np.divmod(np.arange(POINTS), SIZE)
+        index = ((rows[:, None] - rows[None, :] + SIZE - 1) * SPAN
+                 + (cols[:, None] - cols[None, :] + SIZE - 1))
+        self.register_buffer("index", torch.from_numpy(index), persistent=False)
+
+    def attention_bias(self):
+        """[1, heads, 225, 225] additive bias, broadcast over query batch."""
+        return self.bias[:, self.index.reshape(-1)].reshape(1, self.heads, POINTS, POINTS)
+
+    def forward(self, x):
+        if x.shape[-2:] != (SIZE, SIZE):
+            raise ValueError(f"Expected a {SIZE}x{SIZE} board, got {tuple(x.shape[-2:])}")
+        batch = x.shape[0]
+        tokens = x.flatten(2).transpose(1, 2)                       # [B, 225, C]
+
+        normed = self.ln1(tokens)
+        q, k, v = self.qkv(normed).chunk(3, dim=-1)
+        shape = (batch, POINTS, self.heads, self.dim)
+        q, k, v = (part.reshape(shape).transpose(1, 2) for part in (q, k, v))
+        attended = F.scaled_dot_product_attention(q, k, v, attn_mask=self.attention_bias())
+        attended = attended.transpose(1, 2).reshape(batch, POINTS, self.channels)
+        tokens = tokens + self.proj(attended)
+
+        tokens = tokens + self.mlp(self.ln2(tokens))
+        return tokens.transpose(1, 2).reshape(batch, self.channels, SIZE, SIZE)
+
+
+class HybridNetwork(nn.Module):
+    """Shared trunk assembled from the architecture's block pattern."""
+    def __init__(self, arch):
+        super().__init__()
+        width, pattern, hybrid = architecture(arch)
+        if not hybrid:
+            raise ValueError(f"{arch!r} is not a hybrid architecture")
+        if width % 2:
+            raise ValueError(f"Architecture width must be even, got {width}")
+        blocks = [Residual(width) if kind == "R" else TransformerBlock(width, heads_for(width))
+                  for kind in pattern]
+        self.arch, self.pattern, self.width = arch, pattern, width
+        self.blocks = len(blocks)
+        self.transformer_blocks = pattern.count("T")
+        self.heads = heads_for(width)
+        self.trunk = nn.Sequential(nn.Conv2d(PLANES, width, 3, padding=1, bias=False),
+                                   nn.BatchNorm2d(width), nn.ReLU(), *blocks)
+        self.policy = nn.Sequential(nn.Conv2d(width, 2, 1), nn.ReLU(), nn.Flatten(),
+                                    nn.Linear(2 * POINTS, POINTS))
+        # Pool the trunk before reducing it: a 1x1 conv first would collapse the
+        # channels and leave nothing to pool over the board.
+        self.value = nn.Sequential(nn.Linear(width, 64), nn.ReLU(), nn.Linear(64, 1), nn.Tanh())
+
+    def forward(self, x):
+        if x.shape[-2:] != (SIZE, SIZE):
+            # Checked here rather than inside the transformer so any board size
+            # mismatch fails with one clear message instead of a shape error
+            # buried in whichever head happens to run first.
+            raise ValueError(f"Expected a {SIZE}x{SIZE} board, got {tuple(x.shape[-2:])}")
+        x = self.trunk(x)
+        value = self.value(x.mean(dim=(2, 3)))
+        return self.policy(x), value.squeeze(-1)
+
+
+class LegacyNetwork(nn.Module):
+    """The original 64x6 convolutional network, retained byte-for-byte.
+
+    Every parameter name and every head matches the checkpoints produced before
+    the hybrid existed, which is what lets ``runs/freestyle-hybrid`` and the
+    pretrained weights keep loading. Keep the shape of this class frozen.
+    """
+    def __init__(self, arch=LEGACY_ARCH):
+        super().__init__()
+        width, pattern, hybrid = architecture(arch)
+        if hybrid:
+            raise ValueError(f"{arch!r} is not a legacy architecture")
+        blocks = [Residual(width) for _ in pattern]
+        self.arch, self.pattern, self.width = arch, pattern, width
+        self.blocks = len(blocks)
+        self.transformer_blocks = 0
+        self.heads = heads_for(width)
+        self.trunk = nn.Sequential(nn.Conv2d(PLANES, width, 3, padding=1, bias=False),
+                                   nn.BatchNorm2d(width), nn.ReLU(), *blocks)
+        self.policy = nn.Sequential(nn.Conv2d(width, 2, 1), nn.ReLU(), nn.Flatten(),
+                                    nn.Linear(2 * POINTS, POINTS))
+        self.value = nn.Sequential(nn.Conv2d(width, 1, 1), nn.ReLU(), nn.Flatten(),
+                                   nn.Linear(POINTS, 64), nn.ReLU(), nn.Linear(64, 1), nn.Tanh())
 
     def forward(self, x):
         x = self.trunk(x)
         return self.policy(x), self.value(x).squeeze(-1)
+
+
+def build(arch=DEFAULT_ARCH):
+    """Instantiate the network family the architecture name selects."""
+    _, _, hybrid = architecture(arch)
+    return (HybridNetwork if hybrid else LegacyNetwork)(arch)
+
+
+def Network(arch=DEFAULT_ARCH):
+    """Default factory; ``build`` is the same thing and reads better at call sites."""
+    return build(arch)
+
+
+def architecture_of(config):
+    """The architecture a stored config describes.
+
+    Checkpoints written before ``arch`` existed only carry ``channels`` and
+    ``blocks``; resolve those back to a name so resuming an old run reports a
+    real configuration difference instead of a wall of missing state-dict keys.
+    """
+    if config.get("arch"):
+        return config["arch"]
+    for name, entry in ARCHITECTURES.items():
+        if entry["width"] == config.get("channels") and len(entry["pattern"]) == config.get("blocks"):
+            return name
+    raise ValueError(f"No architecture matches channels={config.get('channels')} "
+                     f"blocks={config.get('blocks')}")
 
 
 def device_check(device):

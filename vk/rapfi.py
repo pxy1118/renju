@@ -35,6 +35,11 @@ class RapfiAnalysis:
 
 _COORD = re.compile(r"^(\d+),(\d+)$")
 
+# Gomocup wire rule ids, as implemented by Rapfi's "INFO RULE" handler. Both 2
+# and 4 mean Renju; 4 is the canonical value. Freestyle is the engine default,
+# so an unset rule keeps the previous behaviour without sending anything.
+RAPFI_RULES = {"freestyle": 0, "standard": 1, "renju": 4}
+
 
 def _action(text):
     match = _COORD.match(text.strip())
@@ -70,13 +75,16 @@ def board_command(game):
 
 class RapfiClient:
     def __init__(self, engine, engine_dir, threads=4, hash_mb=256,
-                 max_nodes=200_000, timeout=5.0, retries=2):
+                 max_nodes=200_000, timeout=5.0, retries=2, rule=None):
         self.engine = Path(engine).resolve()
         self.engine_dir = Path(engine_dir).resolve()
         if not self.engine.is_file() or not self.engine_dir.is_dir():
             raise FileNotFoundError("Rapfi executable or engine directory does not exist")
+        if rule is not None and rule not in RAPFI_RULES:
+            raise ValueError(f"Unsupported engine rule: {rule!r}")
         self.threads, self.hash_mb = int(threads), int(hash_mb)
         self.max_nodes, self.timeout, self.retries = int(max_nodes), float(timeout), int(retries)
+        self.rule = rule
         self.process = None
         self.lines = None
         self.version = "unknown"
@@ -124,10 +132,11 @@ class RapfiClient:
         threading.Thread(target=self._reader, args=(self.process.stdout,), daemon=True).start()
         self._send("START 15")
         self._wait_for(lambda line: line == "OK")
-        for command in (
-            "INFO RULE 0", f"INFO THREAD_NUM {self.threads}",
-            f"INFO HASH_SIZE {self.hash_mb}", f"INFO MAX_NODE {self.max_nodes}",
-            "INFO SHOW_DETAIL 3"):
+        commands = ["INFO RULE 0" if self.rule is None else f"INFO RULE {RAPFI_RULES[self.rule]}",
+                    f"INFO THREAD_NUM {self.threads}",
+                    f"INFO HASH_SIZE {self.hash_mb}", f"INFO MAX_NODE {self.max_nodes}",
+                    "INFO SHOW_DETAIL 3"]
+        for command in commands:
             self._send(command)
         self._send("YXSHOWINFO")
 
@@ -155,8 +164,10 @@ class RapfiClient:
         self.close()
 
     def _analyze_once(self, game, multipv):
-        if game.rule != "freestyle":
-            raise ValueError("The first teacher phase supports freestyle only")
+        # The engine's rule is fixed at startup, so a mismatch would silently
+        # produce analysis for a different game than the board being sent.
+        if self.rule is not None and game.rule != self.rule:
+            raise ValueError(f"Engine is configured for {self.rule}, asked about {game.rule}")
         self._send(board_command(game))
         self._send(f"YXNBEST {int(multipv)}")
         deadline = time.monotonic() + self.timeout

@@ -79,8 +79,8 @@ def test_64_sample_overfit_save_and_weight_only_init(tmp_path, monkeypatch):
     torch.set_num_threads(2)
     dataset, pretrained = tmp_path / "data", tmp_path / "pretrained"
     make_dataset(dataset)
-    report = pretrain(dataset, pretrained, steps=80, batch_size=64, channels=4,
-                      blocks=1, device="cpu", warmup_steps=1,
+    report = pretrain(dataset, pretrained, steps=80, batch_size=64, arch="hybrid-8-1",
+                      device="cpu", warmup_steps=1,
                       learning_rate=0.01, final_learning_rate=0.001)
     assert report["test"]["top1"] == 1 and (pretrained / "best.pt").is_file()
 
@@ -90,7 +90,8 @@ def test_64_sample_overfit_save_and_weight_only_init(tmp_path, monkeypatch):
     perf = {"seconds": 1, "batches": 1, "inference_positions": 1,
             "average_inference_batch_size": 1, "largest_inference_batch_size": 1}
     monkeypatch.setattr(module, "collect", lambda *args: (sample, [stats], perf))
-    cfg = dict(DEFAULTS, channels=4, blocks=1, simulations=1, workers=1,
+    cfg = dict(DEFAULTS, arch="hybrid-8-1", channels=8, blocks=1,
+               simulations=1, workers=1,
                games_per_round=1, train_steps=1, batch_size=1, replay_capacity=10,
                promotion_every=99)
     run = tmp_path / "hybrid"

@@ -6,7 +6,7 @@ import time
 import numpy as np
 import torch
 
-from .network import Network
+from .network import DEFAULT_ARCH, Network, architecture
 from .training import atomic_save, augment
 
 
@@ -54,11 +54,9 @@ def _metrics(model, data, device, batch_size=1024):
 
 
 def pretrain(dataset, output, rule="freestyle", steps=20_000, batch_size=256,
-             channels=64, blocks=6, device="cuda", seed=20260910,
+             arch=DEFAULT_ARCH, device="cuda", seed=20260910,
              warmup_steps=500, learning_rate=3e-4, final_learning_rate=3e-5,
              weight_decay=1e-4):
-    if rule != "freestyle":
-        raise ValueError("The first teacher phase supports freestyle only")
     output = Path(output)
     if output.exists() and any(output.iterdir()):
         raise ValueError(f"Pretraining output is not empty: {output}")
@@ -69,14 +67,20 @@ def pretrain(dataset, output, rule="freestyle", steps=20_000, batch_size=256,
     train, validation, test = (load_split(dataset, name) for name in ("train", "validation", "test"))
     torch.manual_seed(seed)
     rng = np.random.default_rng(seed)
-    model = Network(channels, blocks).to(device)
+    model = Network(arch).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
-    cfg = {"rule": rule, "channels": channels, "blocks": blocks, "simulations": 400,
+    width, _, _ = architecture(arch)
+    cfg = {"rule": rule, "arch": arch, "channels": width, "blocks": model.blocks,
+           "simulations": 400,
            "cpuct": 2.0, "temperature_moves": 20, "workers": 16, "games_per_round": 64,
            "train_steps": 100, "replay_capacity": 200000, "batch_size": 256,
            "learning_rate": 0.001, "weight_decay": 0.0001, "seed": seed,
-           "eval_every": 5, "eval_pairs": 100, "min_replay_size": 20000,
-           "promotion_every": 5, "promotion_pairs": 100}
+           "eval_every": 5, "eval_pairs": 100,
+           # Self-play produces roughly one round of samples before the first
+           # update; a round cut short by the deadline must still unlock it, so
+           # the threshold is set well below a full round's output.
+           "min_replay_size": 256,
+           "promotion_every": 5, "promotion_pairs": 100, "opening_plies": 8}
     best_score, started = math.inf, time.monotonic()
     log_path = output / "metrics.jsonl"
     for step in range(1, steps + 1):

@@ -1,4 +1,5 @@
 """Spawned CPU actors request inference from one parent GPU process."""
+import copy
 import multiprocessing as mp
 import queue
 import signal
@@ -6,15 +7,26 @@ import time
 import traceback
 import numpy as np
 from .game import Game
+from .openings import balanced_opening, opening_moves
 from .search import MCTS, SearchStopped
 
 
-def play_game(rule, evaluator, simulations, seed, stop=lambda: False, cpuct=2.0, temperature_moves=20):
+def play_game(rule, evaluator, simulations, seed, stop=lambda: False, cpuct=2.0,
+              temperature_moves=20, opening_plies=8, opening=None):
+    """Play one self-play game, optionally from a supplied opening position.
+
+    ``opening`` is copied, never mutated: the caller keeps its own game so a
+    paired arena match can hand the same start to both colours.
+    """
+    g = copy.copy(opening) if opening is not None \
+        else balanced_opening(rule, seed, opening_plies)
+    # Reset after the opening so the exploration stream depends on the seed
+    # alone, not on how many moves the opening happened to consume.
     rng = np.random.default_rng(seed)
-    g = Game(rule)
     tree = MCTS(evaluator, simulations, cpuct, rng)
     samples = []
-    moves = []
+    opening = opening_moves(g)
+    moves = list(opening)
     search_stats = []
     while g.adjudicate() is None:
         pi = tree.policy(g, noise=True, stop=stop)
@@ -28,9 +40,11 @@ def play_game(rule, evaluator, simulations, seed, stop=lambda: False, cpuct=2.0,
         moves.append(a)
     return [(x, p, float(player*g.winner)) for x, p, player in samples], {
         "winner": g.winner, "moves": moves, "simulations": tree.completed,
+        "opening": opening,
         "candidate_count_mean": float(np.mean([s["candidate_count"] for s in search_stats])),
         "forced_win_count": sum(s["forced_win"] for s in search_stats),
         "forced_defense_count": sum(s["forced_defense"] for s in search_stats),
+        "strategic_count": sum(s["strategic"] for s in search_stats),
         "search_max_depth": max(s["max_depth"] for s in search_stats),
         "search_prior_kl_mean": float(np.mean([s["search_prior_kl"] for s in search_stats])),
         "value_abs_mean": float(np.mean([s["value_abs_mean"] for s in search_stats]))}
@@ -53,7 +67,8 @@ def _actor(worker, tasks, requests, response, results, cancel, cfg):
                 return
             try:
                 data, stats = play_game(cfg["rule"], evaluate, cfg["simulations"], seed,
-                                        cancel.is_set, cfg["cpuct"], cfg["temperature_moves"])
+                                        cancel.is_set, cfg["cpuct"], cfg["temperature_moves"],
+                                        cfg.get("opening_plies", 8))
                 results.put(("game", data, stats))
             except SearchStopped:
                 return

@@ -88,11 +88,16 @@ def _split(game_id):
     return "train" if bucket < 8 else "validation" if bucket == 8 else "test"
 
 
-def _play_teacher_game(client, game_id, seed, sample_plies):
-    rng, game, records = np.random.default_rng(seed), Game("freestyle"), []
-    # Rapfi's empty-board shortcut returns only the forced center and no value.
-    # Do not manufacture a value label; begin recording after that forced move.
-    game.move(112)
+def _play_teacher_game(client, game_id, seed, sample_plies, rule="freestyle"):
+    rng, game, records = np.random.default_rng(seed), Game(rule), []
+    # Open the game without asking the engine: on a near-empty board it answers
+    # a shortcut that carries no value records. Freestyle has no forced first
+    # point, so one is drawn; Renju forces the centre and then has exactly one
+    # legal reply, so drawing from the legal set covers both rules.
+    game.move(int(rng.choice(np.flatnonzero(game.legal()))))
+    reply = np.flatnonzero(game.legal())
+    if len(reply) == 1:
+        game.move(int(reply[0]))
     while game.adjudicate() is None:
         analysis = client.analyze(game, 5)
         target = teacher_policy(game, analysis.moves)
@@ -118,7 +123,7 @@ def _play_teacher_game(client, game_id, seed, sample_plies):
 def generate_teacher_dataset(engine, engine_dir, output, positions=50_000, workers=4,
                              threads=4, hash_mb=256, max_nodes=200_000, timeout=5.0,
                              retries=2, seed=20260910, shard_size=4096,
-                             sample_plies=12):
+                             sample_plies=12, rule="freestyle"):
     output = Path(output)
     if output.exists() and any(output.iterdir()):
         raise ValueError(f"Teacher output is not empty: {output}")
@@ -127,13 +132,14 @@ def generate_teacher_dataset(engine, engine_dir, output, positions=50_000, worke
 
     def client():
         if not hasattr(local, "client"):
-            local.client = RapfiClient(engine, engine_dir, threads, hash_mb, max_nodes, timeout, retries)
+            local.client = RapfiClient(engine, engine_dir, threads, hash_mb, max_nodes,
+                                       timeout, retries, rule)
             with lock:
                 clients.append(local.client)
         return local.client
 
     def play(gid):
-        return _play_teacher_game(client(), gid, seed + gid * 1_000_003, sample_plies)
+        return _play_teacher_game(client(), gid, seed + gid * 1_000_003, sample_plies, rule)
 
     writer, seen, game_id, failures, stalled_waves = ShardWriter(output, shard_size), set(), 0, 0, 0
     audit_pairs = 0
@@ -166,7 +172,7 @@ def generate_teacher_dataset(engine, engine_dir, output, positions=50_000, worke
                         player = 1 if bool(record["state"][2, 0, 0]) else -1
                         board = np.where(record["state"][0], player,
                                          np.where(record["state"][1], -player, 0))
-                        key = canonical_key(Game("freestyle", board, player))
+                        key = canonical_key(Game(rule, board, player))
                         if key not in seen:
                             seen.add(key)
                             writer.add(split, record)
@@ -196,7 +202,7 @@ def generate_teacher_dataset(engine, engine_dir, output, positions=50_000, worke
                     if path.is_file() and (path.name == "config.toml" or path.suffix.lower() in {".bin", ".nnue", ".lz4"})]
     manifest = {
         "format": "renju-rapfi-teacher-npz", "format_version": FORMAT_VERSION,
-        "rule": "freestyle", "seed": seed, "positions_requested": positions,
+        "rule": rule, "seed": seed, "positions_requested": positions,
         "positions_written": sum(writer.counts.values()), "games_attempted": game_id,
         "failed_games": failures, "split": "game_id modulo 10: 0-7/8/9",
         "counts": writer.counts, "shards": writer.shards, "shard_size": shard_size,
@@ -207,7 +213,7 @@ def generate_teacher_dataset(engine, engine_dir, output, positions=50_000, worke
                          for path in sorted(source_files)],
         "generation": {"workers": workers, "threads_per_engine": threads, "hash_mb": hash_mb,
                        "max_nodes": max_nodes, "timeout_seconds": timeout, "retries": retries,
-                       "multipv": 5, "sample_plies": sample_plies,
+                       "multipv": 5, "sample_plies": sample_plies, "rule": rule,
                        "yxboard_roles": "1=current player, 2=opponent",
                        "policy_mix": {"teacher": 0.98, "local_candidates": 0.02}},
         "value_perspective_audit": perspective_audit,

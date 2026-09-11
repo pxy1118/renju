@@ -4,6 +4,7 @@ import numpy as np
 import pytest
 import torch
 from vk.game import Game
+from vk.openings import balanced_opening
 from vk.search import MCTS, SearchStopped
 from vk.network import Network, Evaluator
 from vk.training import DEFAULTS, augment, update, save, load_checkpoint, train, reconcile_jsonl
@@ -62,8 +63,11 @@ def test_invalid_inference_fails_explicitly():
 @pytest.mark.parametrize("rule", ["freestyle","renju"])
 def test_full_game_labels(rule):
     data,stats = play_game(rule,uniform,1,441)
-    g = Game(rule)
-    for (x,pi,z),a in zip(data,stats["moves"]):
+    # Samples cover the searched moves only, so replay starts from the opening
+    # the game actually began in.
+    g = balanced_opening(rule,441)
+    assert stats["opening"] == [int(a) for a in g.history]
+    for (x,pi,z),a in zip(data,stats["moves"][len(stats["opening"]):]):
         assert np.array_equal(x,g.encode())
         assert pi.sum() == 1
         assert not pi[~g.legal()].any()
@@ -88,8 +92,8 @@ def test_augment_alignment_all_eight():
 
 def test_update_checkpoint_roundtrip_and_isolation(tmp_path):
     torch.set_num_threads(2)
-    cfg = dict(DEFAULTS,channels=8,blocks=1)
-    model = Network(8,1)
+    cfg = dict(DEFAULTS,arch="hybrid-8-1",channels=8,blocks=1)
+    model = Network("hybrid-8-1")
     opt = torch.optim.Adam(model.parameters())
     rng = np.random.default_rng(8)
     replay = deque([(Game().encode(), np.full(225,1/225),1.0)],maxlen=1000)
@@ -102,7 +106,7 @@ def test_update_checkpoint_roundtrip_and_isolation(tmp_path):
     assert len(list(tmp_path.glob("checkpoint-*.pt"))) == 3
     state = load_checkpoint(path,"freestyle")
     assert state["step"] == 4 and len(state["replay"]) == 1
-    restored = Network(8,1)
+    restored = Network("hybrid-8-1")
     restored.load_state_dict(state["model"])
     assert np.allclose(Evaluator(restored,"cpu")(Game().encode())[0],Evaluator(model,"cpu")(Game().encode())[0])
     with pytest.raises(ValueError):
@@ -142,11 +146,56 @@ def test_resume_reconciles_uncommitted_jsonl(tmp_path):
 
 def test_neural_arena_uses_batched_workers():
     import time
-    model = Network(4, 1)
-    cfg = dict(DEFAULTS, channels=4, blocks=1, workers=2, simulations=1)
-    report = match(model, cfg, "cpu", Network(4, 1), pairs=1,
+    model = Network("hybrid-8-1")
+    cfg = dict(DEFAULTS, arch="hybrid-8-1", channels=8, blocks=1, workers=2, simulations=1)
+    report = match(model, cfg, "cpu", Network("hybrid-8-1"), pairs=1,
                    deadline=time.monotonic() + 30)
     assert report["games"] == 2 and report["complete"]
+
+
+def test_collect_starts_every_game_from_its_balanced_opening():
+    import time
+    class Batch:
+        def batch(self, states):
+            return np.zeros((len(states), 225)), np.zeros(len(states))
+    cfg = dict(DEFAULTS, workers=1, simulations=1, opening_plies=8)
+    _, games, _ = collect(cfg, Batch(), [17], time.monotonic() + 30)
+    game = games[0]
+    assert len(game["opening"]) == 8
+    assert game["moves"][:8] == game["opening"]
+    assert game["opening"] == [int(a) for a in balanced_opening("freestyle", 17, 8).history]
+
+
+def test_collect_without_an_opening_starts_from_the_empty_board():
+    import time
+    class Batch:
+        def batch(self, states):
+            return np.zeros((len(states), 225)), np.zeros(len(states))
+    cfg = dict(DEFAULTS, workers=1, simulations=1, opening_plies=0)
+    _, games, _ = collect(cfg, Batch(), [5], time.monotonic() + 30)
+    assert games[0]["opening"] == []
+
+
+def test_metrics_record_expose_whether_training_can_start(tmp_path, monkeypatch):
+    """The starvation bug was invisible; these fields make it visible."""
+    import vk.training as module
+    data = [(Game().encode(), np.full(225, 1 / 225), 1.0)]
+    stats = {"winner": 1, "moves": [112], "simulations": 1, "opening": []}
+    perf = {"seconds": 1, "batches": 1, "inference_positions": 1,
+            "average_inference_batch_size": 1, "largest_inference_batch_size": 1}
+    monkeypatch.setattr(module, "collect", lambda *args: (data, [stats], perf))
+
+    locked = dict(DEFAULTS, arch="hybrid-8-1", channels=8, blocks=1, train_steps=1, batch_size=1,
+                  min_replay_size=10_000)
+    module.train(locked, tmp_path / "locked", "cpu", 30, max_rounds=1)
+    record = json.loads((tmp_path / "locked" / "metrics.jsonl").read_text().splitlines()[0])
+    assert record["trainable"] is False and record["updates"] == 0
+    assert record["min_replay_size"] == 10_000
+
+    open_ = dict(locked, min_replay_size=1)
+    module.train(open_, tmp_path / "open", "cpu", 30, max_rounds=1)
+    record = json.loads((tmp_path / "open" / "metrics.jsonl").read_text().splitlines()[0])
+    assert record["trainable"] is True and record["updates"] == 1
 
 
 def test_paired_statistics_and_config(tmp_path):

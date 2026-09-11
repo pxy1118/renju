@@ -8,7 +8,8 @@ import time
 import numpy as np
 import torch
 from .game import Game
-from .network import Network, Evaluator, device_check
+from .network import (ARCHITECTURES, Network, Evaluator, architecture,
+                      architecture_of, device_check, parameter_count)
 from .search import MCTS
 from .training import DEFAULTS, train, checkpoint_path, load_checkpoint
 
@@ -52,8 +53,18 @@ def read_config(path, rule):
         cfg.update(values)
     cfg["rule"] = rule
     for k, v in cfg.items():
-        if k != "rule" and (not isinstance(v,(float,int)) or isinstance(v,bool) or v < 0):
+        if k in ("rule", "arch"):
+            continue
+        if not isinstance(v,(float,int)) or isinstance(v,bool) or v < 0:
             raise ValueError(f"Invalid configuration: {k}")
+    if cfg["arch"] not in ARCHITECTURES:
+        raise ValueError(f"Unknown architecture: {cfg['arch']!r} "
+                         f"(known: {sorted(ARCHITECTURES)})")
+    width, pattern, _ = architecture(cfg["arch"])
+    if cfg["channels"] != width or cfg["blocks"] != len(pattern):
+        raise ValueError(f"channels/blocks disagree with {cfg['arch']}: "
+                         f"expected {width}/{len(pattern)}, "
+                         f"got {cfg['channels']}/{cfg['blocks']}")
     for k in ("channels", "blocks", "simulations", "workers", "games_per_round", "train_steps", "replay_capacity", "batch_size", "eval_every", "eval_pairs", "min_replay_size", "promotion_every", "promotion_pairs"):
         if not isinstance(cfg[k],int) or cfg[k] < 1:
             raise ValueError(f"{k} must be a positive integer")
@@ -150,15 +161,16 @@ def main():
     if args.resume and args.init_checkpoint:
         p.error("--resume and --init-checkpoint are mutually exclusive")
     if args.command == "teacher-generate":
-        if args.rule != "freestyle" or not args.engine or not args.engine_dir or not args.output:
-            p.error("teacher-generate requires --rule freestyle, --engine, --engine-dir and --output")
+        if not args.engine or not args.engine_dir or not args.output:
+            p.error("teacher-generate requires --engine, --engine-dir and --output")
         if min(args.positions, args.engine_workers, args.engine_threads, args.engine_hash_mb,
                args.max_nodes, args.engine_timeout) <= 0:
             p.error("Teacher generation numeric arguments must be positive")
         from .teacher import generate_teacher_dataset
         print(json.dumps(generate_teacher_dataset(
             args.engine, args.engine_dir, args.output, args.positions, args.engine_workers,
-            args.engine_threads, args.engine_hash_mb, args.max_nodes, args.engine_timeout)), flush=True)
+            args.engine_threads, args.engine_hash_mb, args.max_nodes, args.engine_timeout,
+            rule=args.rule)), flush=True)
         return
     if args.hours <= 0 or args.minutes <= 0 or args.pairs <= 0 or (args.max_rounds is not None and args.max_rounds < 1):
         p.error("Budgets, pairs and max-rounds must be positive")
@@ -176,13 +188,13 @@ def main():
     with gpu_lock(args.device):
         print(json.dumps(device_check(args.device)), flush=True)
         if args.command == "pretrain":
-            if args.rule != "freestyle" or not args.dataset or not args.output:
-                p.error("pretrain requires --rule freestyle, --dataset and --output")
+            if not args.dataset or not args.output:
+                p.error("pretrain requires --dataset and --output")
             if args.steps <= 0:
                 p.error("--steps must be positive")
             from .pretraining import pretrain
             print(json.dumps(pretrain(args.dataset, args.output, args.rule, args.steps,
-                                      cfg["batch_size"], cfg["channels"], cfg["blocks"],
+                                      cfg["batch_size"], cfg["arch"],
                                       args.device, cfg["seed"])), flush=True)
             return
         if args.command == "doctor":
@@ -190,6 +202,10 @@ def main():
             x = torch.randn(4,3,15,15,device=args.device)
             logits, value = model(x)
             (logits.square().mean()+value.square().mean()).backward()
+            print(json.dumps({"arch": model.arch, "pattern": model.pattern,
+                              "width": model.width, "heads": model.heads,
+                              "blocks": model.blocks, "parameters": parameter_count(model)}),
+                  flush=True)
             print("Network CUDA forward/backward OK", flush=True)
             return
         if args.command == "train":
@@ -210,7 +226,7 @@ def main():
                     p.error("--workers must be positive")
                 cfg["workers"] = args.workers
             torch.manual_seed(cfg["seed"])
-            model = Network(cfg["channels"],cfg["blocks"]).to(args.device)
+            model = Network(cfg["arch"]).to(args.device)
             model.eval()
             start = time.monotonic()
             data, games, perf = collect(cfg, Evaluator(model,args.device), range(10000),
@@ -229,7 +245,7 @@ def main():
         else:
             state = load_checkpoint(checkpoint_path(root,args.checkpoint),args.rule)
             cfg = state["config"]
-            model = Network(cfg["channels"],cfg["blocks"]).to(args.device)
+            model = Network(cfg["arch"]).to(args.device)
             model.load_state_dict(state["model"])
             del state
             if args.command == "evaluate":
@@ -246,8 +262,7 @@ def main():
                         p.error("Checkpoint evaluation requires --opponent-checkpoint")
                     from .evaluation import match
                     opponent_state = load_checkpoint(Path(args.opponent_checkpoint), args.rule)
-                    opponent_model = Network(opponent_state["config"]["channels"],
-                                             opponent_state["config"]["blocks"]).to(args.device)
+                    opponent_model = Network(architecture_of(opponent_state["config"])).to(args.device)
                     opponent_model.load_state_dict(opponent_state["model"])
                     report = {"checkpoint": match(model, cfg, args.device, opponent_model,
                                                    args.pairs, time.monotonic()+args.minutes*60,

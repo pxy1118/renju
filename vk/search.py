@@ -95,6 +95,7 @@ class MCTS:
             "candidate_mode": self.root.candidate_mode,
             "forced_win": int(self.root.candidate_mode == "forced_win"),
             "forced_defense": int(self.root.candidate_mode == "forced_defense"),
+            "strategic": int(self.root.candidate_mode == "strategic"),
             "max_depth": max_depth,
             "search_prior_kl": kl,
             "value_abs_mean": float(np.mean(values)) if values else 0.0,
