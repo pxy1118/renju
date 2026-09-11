@@ -15,8 +15,10 @@ def play_game(rule, evaluator, simulations, seed, stop=lambda: False, cpuct=2.0,
     tree = MCTS(evaluator, simulations, cpuct, rng)
     samples = []
     moves = []
+    search_stats = []
     while g.adjudicate() is None:
         pi = tree.policy(g, noise=True, stop=stop)
+        search_stats.append(tree.last_stats)
         samples.append((g.encode().astype(np.uint8), pi.astype(np.float16), g.player))
         probabilities = pi.astype(np.float64)
         probabilities /= probabilities.sum()
@@ -25,7 +27,13 @@ def play_game(rule, evaluator, simulations, seed, stop=lambda: False, cpuct=2.0,
         tree.advance(a, g)
         moves.append(a)
     return [(x, p, float(player*g.winner)) for x, p, player in samples], {
-        "winner": g.winner, "moves": moves, "simulations": tree.completed}
+        "winner": g.winner, "moves": moves, "simulations": tree.completed,
+        "candidate_count_mean": float(np.mean([s["candidate_count"] for s in search_stats])),
+        "forced_win_count": sum(s["forced_win"] for s in search_stats),
+        "forced_defense_count": sum(s["forced_defense"] for s in search_stats),
+        "search_max_depth": max(s["max_depth"] for s in search_stats),
+        "search_prior_kl_mean": float(np.mean([s["search_prior_kl"] for s in search_stats])),
+        "value_abs_mean": float(np.mean([s["value_abs_mean"] for s in search_stats]))}
 
 
 def _actor(worker, tasks, requests, response, results, cancel, cfg):
@@ -40,9 +48,8 @@ def _actor(worker, tasks, requests, response, results, cancel, cfg):
                     pass
             raise SearchStopped()
         while not cancel.is_set():
-            try:
-                seed = tasks.get(timeout=0.1)
-            except queue.Empty:
+            seed = tasks.get()
+            if seed is None:
                 return
             try:
                 data, stats = play_game(cfg["rule"], evaluate, cfg["simulations"], seed,
@@ -58,9 +65,13 @@ def collect(cfg, evaluator, seeds, deadline, stop=lambda: False):
     ctx = mp.get_context("spawn")
     tasks, requests, results = ctx.Queue(), ctx.Queue(), ctx.Queue()
     cancel = ctx.Event()
+    replies = [ctx.Queue() for _ in range(min(cfg["workers"], len(seeds)))]
     for seed in seeds:
         tasks.put(int(seed))
-    replies = [ctx.Queue() for _ in range(min(cfg["workers"], len(seeds)))]
+    # Explicit sentinels avoid a Windows Queue feeder race where actors could
+    # observe a transient empty queue and exit before all seeds were visible.
+    for _ in replies:
+        tasks.put(None)
     actors = [ctx.Process(target=_actor, args=(i, tasks, requests, replies[i], results, cancel, cfg))
               for i in range(len(replies))]
     samples, games = [], []

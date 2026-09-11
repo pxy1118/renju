@@ -94,16 +94,17 @@ def forbidden(position: bytes, point: int):
 
 
 class Game:
-    def __init__(self, rule="freestyle", board=None, player=1):
+    def __init__(self, rule="freestyle", board=None, player=1, history=None):
         if rule not in ("freestyle", "renju"):
             raise ValueError("Unknown rule")
         self.rule = rule
         self.board = np.zeros(225, np.int8) if board is None else np.array(board, np.int8).reshape(225).copy()
         self.player = player
         self.winner = None
+        self.history = list(history) if history is not None else []
 
     def copy(self):
-        g = Game(self.rule, self.board, self.player)
+        g = Game(self.rule, self.board, self.player, self.history)
         g.winner = self.winner
         return g
 
@@ -141,6 +142,7 @@ class Game:
             raise ValueError("Illegal move under selected rule")
         color = self.player
         self.board[action] = color
+        self.history.append(action)
         spans = lengths(self.board, action, color)
         if (5 in spans if self.rule == "renju" and color == 1 else max(spans) >= 5):
             self.winner = color

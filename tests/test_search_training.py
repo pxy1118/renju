@@ -6,9 +6,9 @@ import torch
 from az.game import Game
 from az.search import MCTS, SearchStopped
 from az.network import Network, Evaluator
-from az.training import DEFAULTS, augment, update, save, load_checkpoint, train
+from az.training import DEFAULTS, augment, update, save, load_checkpoint, train, reconcile_jsonl
 from az.selfplay import play_game, collect
-from az.evaluation import summary
+from az.evaluation import summary, match
 from az.cli import read_config
 
 
@@ -41,7 +41,8 @@ def test_must_defend():
     tree = MCTS(focused,100)
     pi = tree.policy(g)
     assert np.argmax(pi) == 109
-    assert tree.root.w[110] < 0
+    assert pi[110] == 0
+    assert tree.last_stats["candidate_mode"] == "forced_defense"
 
 
 def test_legality_noise_and_stop():
@@ -121,10 +122,41 @@ def test_timeout_does_not_label_partial_games():
     assert data == [] and games == []
 
 
+def test_collect_does_not_drop_tasks_during_worker_startup():
+    import time
+    class Batch:
+        def batch(self, states):
+            return np.zeros((len(states), 225)), np.zeros(len(states))
+    cfg = dict(DEFAULTS, workers=8, simulations=1)
+    _, games, _ = collect(cfg, Batch(), range(8), time.monotonic() + 30)
+    assert len(games) == 8
+
+
+def test_resume_reconciles_uncommitted_jsonl(tmp_path):
+    path = tmp_path / "games.jsonl"
+    path.write_text('\n'.join(json.dumps({"round": value}) for value in (1, 2, 3)) + '\n',
+                    encoding="utf-8")
+    assert reconcile_jsonl(path, 2) == 1
+    assert [json.loads(line)["round"] for line in path.read_text().splitlines()] == [1, 2]
+
+
+def test_neural_arena_uses_batched_workers():
+    import time
+    model = Network(4, 1)
+    cfg = dict(DEFAULTS, channels=4, blocks=1, workers=2, simulations=1)
+    report = match(model, cfg, "cpu", Network(4, 1), pairs=1,
+                   deadline=time.monotonic() + 30)
+    assert report["games"] == 2 and report["complete"]
+
+
 def test_paired_statistics_and_config(tmp_path):
     stats = summary([{"result":1,"color":1},{"result":-1,"color":-1}],2)
     assert stats["score"] == 0.5 and stats["complete"]
     assert stats["by_color"]["1"]["wins"] == 1
+    collapsed = summary([{"result": 1 if i % 2 == 0 else -1,
+                          "color": 1 if i % 2 == 0 else -1, "winner": 1}
+                         for i in range(128)], 128)
+    assert collapsed["color_collapse_detected"] is True
     file = tmp_path/"bad.json"
     file.write_text(json.dumps({"workers":0}))
     with pytest.raises(ValueError):

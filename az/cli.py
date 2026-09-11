@@ -54,7 +54,7 @@ def read_config(path, rule):
     for k, v in cfg.items():
         if k != "rule" and (not isinstance(v,(float,int)) or isinstance(v,bool) or v < 0):
             raise ValueError(f"Invalid configuration: {k}")
-    for k in ("channels", "blocks", "simulations", "workers", "games_per_round", "train_steps", "replay_capacity", "batch_size", "eval_every", "eval_pairs"):
+    for k in ("channels", "blocks", "simulations", "workers", "games_per_round", "train_steps", "replay_capacity", "batch_size", "eval_every", "eval_pairs", "min_replay_size", "promotion_every", "promotion_pairs"):
         if not isinstance(cfg[k],int) or cfg[k] < 1:
             raise ValueError(f"{k} must be a positive integer")
     return cfg
@@ -68,9 +68,26 @@ def display(g):
 
 def main():
     p = argparse.ArgumentParser(description="Dual-rule AlphaZero")
-    p.add_argument("command", choices=["doctor", "train", "benchmark", "evaluate", "play", "webui"])
+    p.add_argument("command", choices=["doctor", "teacher-generate", "pretrain", "train", "benchmark", "evaluate", "play", "webui"])
     p.add_argument("--port", type=int, default=8765, help="local Web UI port")
     p.add_argument("--no-browser", action="store_true", help="do not open the Web UI automatically")
+    p.add_argument("--host", default="127.0.0.1",
+                   help="Web UI bind address; 127.0.0.1 keeps it local, use your LAN IP to share (0.0.0.0 = every interface)")
+    p.add_argument("--share", action="store_true",
+                   help="give each visiting browser its own table; prints an invite link guests can open")
+    p.add_argument("--public", action="store_true",
+                   help="expose the Web UI on the internet with a Cloudflare tunnel and print a shareable link "
+                        "(implies --share and --host 0.0.0.0)")
+    p.add_argument("--cloudflared", metavar="PATH",
+                   help="cloudflared executable to use with --public (default: found on PATH)")
+    p.add_argument("--tunnel-timeout", type=float, default=40.0,
+                   help="seconds to wait for the public link with --public (default 40)")
+    p.add_argument("--max-sessions", type=int, default=10,
+                   help="concurrent shared tables (default 10; each costs tens of MB, "
+                        "the CPU is what runs out first)")
+    p.add_argument("--password", help="optional access password for shared tables")
+    p.add_argument("--trusted-host", action="append", default=[], metavar="AUTHORITY",
+                   help="extra Host authority the UI accepts, for a reverse proxy (repeatable)")
     p.add_argument("--rule", choices=["freestyle", "renju"], default="freestyle")
     p.add_argument("--config")
     p.add_argument("--device", choices=["cuda","cpu"], default="cuda")
@@ -78,17 +95,70 @@ def main():
     p.add_argument("--minutes", type=float, default=3)
     p.add_argument("--output")
     p.add_argument("--resume")
+    p.add_argument("--init-checkpoint")
     p.add_argument("--checkpoint", default="latest")
     p.add_argument("--max-rounds", type=int)
     p.add_argument("--pairs", type=int, default=10)
     p.add_argument("--workers", type=int, help="parallel self-play processes; may be changed when resuming")
     p.add_argument("--human-color", choices=["black","white"], default="black")
+    p.add_argument("--dataset")
+    p.add_argument("--positions", type=int, default=50000)
+    p.add_argument("--steps", type=int, default=20000)
+    p.add_argument("--engine")
+    p.add_argument("--engine-dir")
+    p.add_argument("--opponent", choices=["suite", "rapfi", "checkpoint"], default="suite")
+    p.add_argument("--opponent-checkpoint")
+    p.add_argument("--engine-workers", type=int, default=4)
+    p.add_argument("--engine-threads", type=int, default=4)
+    p.add_argument("--engine-hash-mb", type=int, default=256)
+    p.add_argument("--max-nodes", type=int, default=200000)
+    p.add_argument("--engine-timeout", type=float, default=5.0)
     args = p.parse_args()
     if args.command == "webui":
-        from .webui import serve
+        from .webui import bind_host, serve
         if not 1 <= args.port <= 65535:
             p.error("--port must be between 1 and 65535")
-        serve(args.port, Path(args.output) if args.output else ROOT / "runs", not args.no_browser)
+        # The upper bound is a guard against a typo turning into a memory
+        # exhaustion, not a statement about what this machine can hold: every
+        # table carries its own network and search tree.
+        if not 1 <= args.max_sessions <= 16:
+            p.error("--max-sessions must be between 1 and 16")
+        if args.public:
+            # A tunnel cannot reach a loopback-only server, and a public table is
+            # never a single shared board: both are implied rather than asked for.
+            if not args.share:
+                print("--public 已自动开启分享（每位访客一张独立棋桌）。", flush=True)
+            args.share = True
+            if args.host == "127.0.0.1":
+                args.host = "0.0.0.0"
+            if args.host not in ("0.0.0.0", "::"):
+                p.error("--public 需要 cloudflared 能连上的监听地址，请用 --host 0.0.0.0 "
+                        "（或不写 --host，它会被自动设为 0.0.0.0）")
+            if args.tunnel_timeout <= 0:
+                p.error("--tunnel-timeout must be positive")
+        try:
+            host = bind_host(args.host)
+        except ValueError as exc:
+            p.error(str(exc))
+        serve(args.port, Path(args.output) if args.output else ROOT / "runs", not args.no_browser,
+              host=host, share=args.share, max_sessions=args.max_sessions,
+              password=args.password,
+              trusted_hosts=[item for item in args.trusted_host if item],
+              public=args.public, cloudflared=args.cloudflared,
+              tunnel_timeout=args.tunnel_timeout)
+        return
+    if args.resume and args.init_checkpoint:
+        p.error("--resume and --init-checkpoint are mutually exclusive")
+    if args.command == "teacher-generate":
+        if args.rule != "freestyle" or not args.engine or not args.engine_dir or not args.output:
+            p.error("teacher-generate requires --rule freestyle, --engine, --engine-dir and --output")
+        if min(args.positions, args.engine_workers, args.engine_threads, args.engine_hash_mb,
+               args.max_nodes, args.engine_timeout) <= 0:
+            p.error("Teacher generation numeric arguments must be positive")
+        from .teacher import generate_teacher_dataset
+        print(json.dumps(generate_teacher_dataset(
+            args.engine, args.engine_dir, args.output, args.positions, args.engine_workers,
+            args.engine_threads, args.engine_hash_mb, args.max_nodes, args.engine_timeout)), flush=True)
         return
     if args.hours <= 0 or args.minutes <= 0 or args.pairs <= 0 or (args.max_rounds is not None and args.max_rounds < 1):
         p.error("Budgets, pairs and max-rounds must be positive")
@@ -105,6 +175,16 @@ def main():
         signal.signal(signal.SIGINT, stop_handler)
     with gpu_lock(args.device):
         print(json.dumps(device_check(args.device)), flush=True)
+        if args.command == "pretrain":
+            if args.rule != "freestyle" or not args.dataset or not args.output:
+                p.error("pretrain requires --rule freestyle, --dataset and --output")
+            if args.steps <= 0:
+                p.error("--steps must be positive")
+            from .pretraining import pretrain
+            print(json.dumps(pretrain(args.dataset, args.output, args.rule, args.steps,
+                                      cfg["batch_size"], cfg["channels"], cfg["blocks"],
+                                      args.device, cfg["seed"])), flush=True)
+            return
         if args.command == "doctor":
             model = Network().to(args.device)
             x = torch.randn(4,3,15,15,device=args.device)
@@ -122,7 +202,7 @@ def main():
                     p.error("--workers must be positive")
                 cfg["workers"] = args.workers
             print(json.dumps(train(cfg, root, args.device, args.hours*3600, args.resume,
-                                   lambda: stopping[0], args.max_rounds)), flush=True)
+                                   lambda: stopping[0], args.max_rounds, args.init_checkpoint)), flush=True)
         elif args.command == "benchmark":
             from .selfplay import collect
             if args.workers is not None:
@@ -153,8 +233,27 @@ def main():
             model.load_state_dict(state["model"])
             del state
             if args.command == "evaluate":
-                from .evaluation import evaluate_suite
-                report = evaluate_suite(model,cfg,args.device,root,args.pairs,time.monotonic()+args.minutes*60,lambda: stopping[0])
+                from .evaluation import evaluate_suite, evaluate_rapfi
+                if args.opponent == "rapfi":
+                    if not args.engine or not args.engine_dir or args.rule != "freestyle":
+                        p.error("Rapfi evaluation requires --rule freestyle, --engine and --engine-dir")
+                    report = {"rapfi": evaluate_rapfi(model, cfg, args.device, args.engine,
+                              args.engine_dir, args.pairs, time.monotonic()+args.minutes*60,
+                              lambda: stopping[0], args.engine_threads, args.engine_hash_mb,
+                              args.max_nodes, args.engine_timeout)}
+                elif args.opponent == "checkpoint":
+                    if not args.opponent_checkpoint:
+                        p.error("Checkpoint evaluation requires --opponent-checkpoint")
+                    from .evaluation import match
+                    opponent_state = load_checkpoint(Path(args.opponent_checkpoint), args.rule)
+                    opponent_model = Network(opponent_state["config"]["channels"],
+                                             opponent_state["config"]["blocks"]).to(args.device)
+                    opponent_model.load_state_dict(opponent_state["model"])
+                    report = {"checkpoint": match(model, cfg, args.device, opponent_model,
+                                                   args.pairs, time.monotonic()+args.minutes*60,
+                                                   lambda: stopping[0])}
+                else:
+                    report = evaluate_suite(model,cfg,args.device,root,args.pairs,time.monotonic()+args.minutes*60,lambda: stopping[0])
                 destination = root / f"evaluation-{time.time_ns()}.json"
                 destination.write_text(json.dumps(report,indent=2),encoding="utf-8")
                 print(json.dumps(report),flush=True)

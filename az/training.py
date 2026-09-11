@@ -3,6 +3,7 @@ import os
 from pathlib import Path
 import random
 import time
+import copy
 from collections import deque
 import numpy as np
 import torch
@@ -12,7 +13,8 @@ from .selfplay import collect
 DEFAULTS = dict(rule="freestyle", channels=64, blocks=6, simulations=200, cpuct=2.0,
                 temperature_moves=20, workers=16, games_per_round=32, train_steps=200,
                 replay_capacity=100000, batch_size=256, learning_rate=0.001,
-                weight_decay=0.0001, seed=20260910, eval_every=10, eval_pairs=10)
+                weight_decay=0.0001, seed=20260910, eval_every=10, eval_pairs=10,
+                min_replay_size=1, promotion_every=10, promotion_pairs=10)
 
 
 def augment(x, pi, rotation, mirror):
@@ -84,13 +86,17 @@ def load_checkpoint(path, rule):
     return state
 
 
-def save(root, cfg, model, optimizer, replay, rng, round_id, step, total_games, pending_steps=0):
+def save(root, cfg, model, optimizer, replay, rng, round_id, step, total_games, pending_steps=0,
+         champion_model=None, champion_optimizer=None, champion_step=0, teacher=None):
     state = {"format": 1, "config": cfg, "model": model.state_dict(), "optimizer": optimizer.state_dict(),
              "replay": list(replay), "round": round_id, "step": step, "total_games": total_games,
              "pending_steps": pending_steps,
              "rng": rng.bit_generator.state, "python_rng": random.getstate(),
              "torch_rng": torch.get_rng_state(),
              "cuda_rng": torch.cuda.get_rng_state_all() if next(model.parameters()).is_cuda else None}
+    state.update({"candidate_mode": "tactical_square3_line4",
+                  "champion_model": champion_model, "champion_optimizer": champion_optimizer,
+                  "champion_step": champion_step, "teacher": teacher})
     path = Path(root) / f"checkpoint-{round_id:08d}-{step:010d}.pt"
     atomic_save(state, path)
     for old in sorted(Path(root).glob("checkpoint-*.pt"))[:-3]:
@@ -103,11 +109,37 @@ def append_json(path, record):
         f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
-def train(cfg, root, device, seconds, resume=None, stop=lambda: False, max_rounds=None):
+def reconcile_jsonl(path, committed_round):
+    """Remove diagnostics written after the checkpoint selected for resume."""
+    path = Path(path)
+    if not path.exists():
+        return 0
+    kept, removed = [], 0
+    for line in path.read_text(encoding="utf-8-sig").splitlines():
+        try:
+            record = json.loads(line)
+        except ValueError:
+            removed += 1
+            continue
+        if record.get("round", -1) <= committed_round:
+            kept.append(line)
+        else:
+            removed += 1
+    if removed:
+        temporary = path.with_suffix(path.suffix + ".reconcile.tmp")
+        temporary.write_text("\n".join(kept) + ("\n" if kept else ""), encoding="utf-8")
+        os.replace(temporary, path)
+    return removed
+
+
+def train(cfg, root, device, seconds, resume=None, stop=lambda: False, max_rounds=None,
+          init_checkpoint=None):
     root = Path(root)
+    if resume and init_checkpoint:
+        raise ValueError("--resume and --init-checkpoint are mutually exclusive")
+    if not resume and root.exists() and any(root.iterdir()):
+        raise ValueError("Existing output found: use --resume latest or a different --output.")
     root.mkdir(parents=True, exist_ok=True)
-    if not resume and list(root.glob("checkpoint-*.pt")):
-        raise ValueError("Existing training found: use --resume latest or a different --output.")
     state = load_checkpoint(checkpoint_path(root, resume), cfg["rule"]) if resume else None
     if state:
         if "optimizer" not in state:
@@ -124,6 +156,15 @@ def train(cfg, root, device, seconds, resume=None, stop=lambda: False, max_round
     optimizer = torch.optim.Adam(model.parameters(), lr=cfg["learning_rate"], weight_decay=cfg["weight_decay"])
     replay = deque(maxlen=cfg["replay_capacity"])
     round_id = step = total_games = pending_steps = 0
+    teacher = None
+    if init_checkpoint:
+        initial = load_checkpoint(checkpoint_path(root, init_checkpoint), cfg["rule"])
+        if initial["config"]["channels"] != cfg["channels"] or initial["config"]["blocks"] != cfg["blocks"]:
+            raise ValueError("Initial checkpoint architecture mismatch")
+        if initial.get("pretrain_report") and not initial["pretrain_report"].get("accepted"):
+            raise ValueError("Initial pretraining checkpoint did not pass the formal acceptance gates")
+        model.load_state_dict(initial["model"])
+        teacher = initial.get("teacher")
     if state:
         model.load_state_dict(state["model"])
         optimizer.load_state_dict(state["optimizer"])
@@ -135,11 +176,30 @@ def train(cfg, root, device, seconds, resume=None, stop=lambda: False, max_round
         torch.set_rng_state(state["torch_rng"])
         if state["cuda_rng"] is not None and device == "cuda":
             torch.cuda.set_rng_state_all(state["cuda_rng"])
+        champion_state = copy.deepcopy(state.get("champion_model") or state["model"])
+        champion_optimizer = copy.deepcopy(state.get("champion_optimizer") or optimizer.state_dict())
+        champion_step = state.get("champion_step", step)
+        teacher = state.get("teacher")
+        removed = {name: reconcile_jsonl(root / name, round_id)
+                   for name in ("games.jsonl", "metrics.jsonl", "evaluations.jsonl")}
+        if any(removed.values()):
+            print(json.dumps({"resume_reconciled": removed,
+                              "checkpoint_round": round_id}), flush=True)
         del state
+    else:
+        champion_state = copy.deepcopy(model.state_dict())
+        champion_optimizer = copy.deepcopy(optimizer.state_dict())
+        champion_step = step
+    champion = Network(cfg["channels"], cfg["blocks"]).to(device)
+    champion.load_state_dict(champion_state)
     (root / "config.json").write_text(json.dumps(cfg, indent=2), encoding="utf-8")
     start = time.monotonic()
     deadline = start + seconds
-    evaluator = Evaluator(model, device)
+    evaluator = Evaluator(champion, device)
+    if not (root / "best.pt").exists():
+        atomic_save({"format": 1, "config": cfg, "model": champion_state,
+                     "step": champion_step, "teacher": teacher,
+                     "candidate_mode": "tactical_square3_line4"}, root / "best.pt")
     rounds_this_run = 0
     last_path = None
     while time.monotonic() < deadline and not stop():
@@ -157,10 +217,10 @@ def train(cfg, root, device, seconds, resume=None, stop=lambda: False, max_round
             total_games += len(games)
             for game in games:
                 append_json(root / "games.jsonl", {"round": round_id, **game})
-            pending_steps = cfg["train_steps"] if games else 0
+            pending_steps = cfg["train_steps"] if games and len(replay) >= cfg.get("min_replay_size", 1) else 0
         metrics = {}
         updates = 0
-        if replay:
+        if len(replay) >= cfg.get("min_replay_size", 1):
             for _ in range(pending_steps):
                 if stop() or time.monotonic() >= deadline:
                     break
@@ -168,7 +228,33 @@ def train(cfg, root, device, seconds, resume=None, stop=lambda: False, max_round
                 step += 1
                 updates += 1
                 pending_steps -= 1
-        last_path = save(root, cfg, model, optimizer, replay, rng, round_id, step, total_games,pending_steps)
+        champion_result = None
+        if (updates and pending_steps == 0 and
+                round_id % cfg.get("promotion_every", cfg.get("eval_every", 10)) == 0 and
+                not stop() and time.monotonic() < deadline):
+            from .evaluation import match, tactical_gate
+            tactics = tactical_gate(model, cfg, device)
+            arena = match(model, cfg, device, champion, cfg.get("promotion_pairs", 100),
+                          deadline, stop, sequential=True) if tactics["passed"] else {}
+            promoted = tactics["passed"] and arena.get("wilson_lower", 0) > 0.5
+            champion_result = {"promoted": promoted, "tactical": tactics, "arena": arena}
+            if promoted:
+                champion_state = copy.deepcopy(model.state_dict())
+                champion_optimizer = copy.deepcopy(optimizer.state_dict())
+                champion_step = step
+                champion.load_state_dict(champion_state)
+                atomic_save({"format": 1, "config": cfg, "model": champion_state,
+                             "step": champion_step, "teacher": teacher,
+                             "candidate_mode": "tactical_square3_line4"}, root / "best.pt")
+            else:
+                model.load_state_dict(champion_state)
+                optimizer.load_state_dict(champion_optimizer)
+            append_json(root / "evaluations.jsonl", {"round": round_id, **champion_result})
+        last_path = save(root, cfg, model, optimizer, replay, rng, round_id, step, total_games,
+                         pending_steps, champion_state, champion_optimizer, champion_step, teacher)
+        def average(name):
+            values = [game.get(name) for game in games if game.get(name) is not None]
+            return float(np.mean(values)) if values else None
         record = {"round": round_id, "step": step, "updates": updates, "games": len(games),
                   "total_games": total_games, "replay_size": len(replay), "pending_steps":pending_steps,
                   "elapsed_seconds": time.monotonic()-start, "remaining_seconds": max(0,deadline-time.monotonic()),
@@ -178,20 +264,19 @@ def train(cfg, root, device, seconds, resume=None, stop=lambda: False, max_round
                   "black_win_rate": sum(g["winner"] == 1 for g in games)/len(games) if games else None,
                   "white_win_rate": sum(g["winner"] == -1 for g in games)/len(games) if games else None,
                   "draw_rate": sum(g["winner"] == 0 for g in games)/len(games) if games else None,
+                  "candidate_count_mean": average("candidate_count_mean"),
+                  "forced_win_count": sum(g.get("forced_win_count", 0) for g in games),
+                  "forced_defense_count": sum(g.get("forced_defense_count", 0) for g in games),
+                  "search_max_depth": max((g.get("search_max_depth", 0) for g in games), default=0),
+                  "search_prior_kl_mean": average("search_prior_kl_mean"),
+                  "value_abs_mean": average("value_abs_mean"),
+                  "champion": champion_result,
                   "completed_game_simulations_per_second": sum(g["simulations"] for g in games)/max(perf["seconds"], 1e-6),
                   **perf, **metrics}
         append_json(root / "metrics.jsonl", record)
         print(json.dumps(record), flush=True)
-        if not (root / "best.pt").exists() and updates:
-            atomic_save({"format": 1, "config": cfg, "model": model.state_dict(), "step": step}, root / "best.pt")
-        if updates and pending_steps == 0 and round_id % cfg["eval_every"] == 0 and not stop() and time.monotonic() < deadline:
-            from .evaluation import evaluate_suite
-            result = evaluate_suite(model, cfg, device, root, cfg["eval_pairs"], deadline, stop)
-            append_json(root / "evaluations.jsonl", {"round": round_id, **result})
-            comparison = result.get("historical", {})
-            if comparison.get("complete") and comparison.get("score", 0) > 0.55:
-                atomic_save({"format": 1, "config": cfg, "model": model.state_dict(), "step": step}, root / "best.pt")
     if last_path is None:
-        last_path = save(root, cfg, model, optimizer, replay, rng, round_id, step, total_games,pending_steps)
+        last_path = save(root, cfg, model, optimizer, replay, rng, round_id, step, total_games,
+                         pending_steps, champion_state, champion_optimizer, champion_step, teacher)
     return {"checkpoint": str(last_path), "step": step, "total_games": total_games,
             "elapsed_seconds": time.monotonic()-start}

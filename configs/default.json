@@ -13,5 +13,8 @@
   "weight_decay": 0.0001,
   "seed": 20260910,
   "eval_every": 10,
-  "eval_pairs": 10
+  "eval_pairs": 10,
+  "min_replay_size": 1,
+  "promotion_every": 10,
+  "promotion_pairs": 10
 }
