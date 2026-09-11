@@ -1,4 +1,5 @@
 import numpy as np
+from .candidates import tactical_candidates
 
 
 class SearchStopped(Exception):
@@ -11,6 +12,8 @@ class Node:
         self.n = np.zeros(225, np.int32)
         self.w = np.zeros(225, np.float32)
         self.children = {}
+        self.candidate_mode = None
+        self.candidate_count = 0
 
 
 class MCTS:
@@ -23,13 +26,15 @@ class MCTS:
         self.root = Node()
         self.key = None
         self.completed = 0
+        self.last_stats = {}
 
     @staticmethod
     def state_key(game):
         return game.rule, game.player, game.board.tobytes(), game.winner
 
     def expand(self, node, game):
-        legal = game.legal()
+        candidates = tactical_candidates(game)
+        legal = candidates.mask
         if not legal.any():
             game.adjudicate()
             return float(game.winner * game.player)
@@ -40,6 +45,8 @@ class MCTS:
         p = np.zeros(225, np.float64)
         p[legal] = np.maximum(np.exp(logits[legal] - logits[legal].max()),np.finfo(np.float64).tiny)
         node.p = p / p.sum()
+        node.candidate_mode = candidates.mode
+        node.candidate_count = int(legal.sum())
         return float(value)
 
     def policy(self, game, noise=False, stop=lambda: False):
@@ -56,6 +63,8 @@ class MCTS:
         if noise:
             indices = np.flatnonzero(prior)
             prior[indices] = 0.75 * prior[indices] + 0.25 * self.rng.dirichlet(np.full(len(indices), 0.3))
+        max_depth = 0
+        values = []
         for _ in range(self.simulations):
             if stop():
                 raise SearchStopped()
@@ -69,14 +78,28 @@ class MCTS:
                 path.append((node, a))
                 state.move(a, validate=False)
                 node = node.children.setdefault(a, Node())
+            max_depth = max(max_depth, len(path))
             value = float(state.winner * state.player) if state.winner is not None else self.expand(node, state)
+            values.append(abs(value))
             for parent, a in reversed(path):
                 value = -value
                 parent.n[a] += 1
                 parent.w[a] += value
             self.completed += 1
         visits = self.root.n.astype(np.float64)
-        return (visits / visits.sum()).astype(np.float32)
+        policy = visits / visits.sum()
+        support = (policy > 0) & (self.root.p > 0)
+        kl = float(np.sum(policy[support] * np.log(policy[support] / self.root.p[support])))
+        self.last_stats = {
+            "candidate_count": self.root.candidate_count,
+            "candidate_mode": self.root.candidate_mode,
+            "forced_win": int(self.root.candidate_mode == "forced_win"),
+            "forced_defense": int(self.root.candidate_mode == "forced_defense"),
+            "max_depth": max_depth,
+            "search_prior_kl": kl,
+            "value_abs_mean": float(np.mean(values)) if values else 0.0,
+        }
+        return policy.astype(np.float32)
 
     def advance(self, action, game):
         self.root = self.root.children.get(int(action), Node())
