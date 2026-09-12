@@ -178,6 +178,40 @@ def summary(results, expected):
     return report
 
 
+def best_case_wilson_lower(results, pairs):
+    """Wilson lower bound if every unplayed pair were a clean sweep.
+
+    The gate accepts only when the full-schedule Wilson lower bound clears
+    0.5, so once even winning the entire rest of the schedule cannot clear
+    it, the final decision is already determined and the match may stop.
+    Returns ``None`` when the schedule is already complete.
+    """
+    done = len(results) // 2
+    remaining = pairs - done
+    if remaining <= 0:
+        return None
+    pair_scores = [(results[i]["result"] + results[i + 1]["result"] + 2) / 4
+                   for i in range(0, len(results) - 1, 2)]
+    best = (sum(pair_scores) + remaining) / pairs
+    return wilson_interval(best, pairs)[0]
+
+
+def _arena_tasks(cfg, pairs):
+    """The (pair, color, start) schedule both arena backends share.
+
+    One balanced opening per pair, played by both colours — the pairing is
+    what lets the score partial out the first-move advantage.
+    """
+    mode = cfg.get("opening_mode", "sampled")
+    book = load_book(cfg)
+    tasks = []
+    for pair in range(pairs):
+        start = opening(cfg["rule"], 91823 + pair, mode, cfg.get("opening_plies", 8), book=book)
+        for color in (1, -1):
+            tasks.append((pair, color, start))
+    return tasks
+
+
 def _arena_actor(worker, tasks, requests, response, results, cancel, cfg):
     signal.signal(signal.SIGINT, signal.SIG_IGN)
     try:
@@ -217,23 +251,22 @@ def _arena_actor(worker, tasks, requests, response, results, cancel, cfg):
         results.put(("error", worker, traceback.format_exc()))
 
 
-def _batched_match(model, cfg, device, opponent, pairs, deadline, stop, sequential):
+def _batched_match(model, cfg, device, opponent, pairs, deadline, stop, sequential,
+                   simulations=None):
     """Run neural-vs-neural arena games concurrently with central batched inference."""
+    sims = int(simulations) if simulations else cfg["simulations"]
     ctx = mp.get_context("spawn")
     tasks, requests, results = ctx.Queue(), ctx.Queue(), ctx.Queue()
     cancel = ctx.Event()
     worker_count = min(cfg.get("workers", 1), pairs * 2)
     replies = [ctx.Queue() for _ in range(worker_count)]
-    for pair in range(pairs):
-        # One shared, balanced opening per pair: both colours face the same
-        # position, which is what makes the paired comparison meaningful.
-        start = balanced_opening(cfg["rule"], 91823 + pair, cfg.get("opening_plies", 8))
-        for color in (1, -1):
-            tasks.put((pair, color, start))
+    for pair, color, start in _arena_tasks(cfg, pairs):
+        tasks.put((pair, color, start))
     for _ in replies:
         tasks.put(None)
     actors = [ctx.Process(target=_arena_actor,
-                          args=(i, tasks, requests, replies[i], results, cancel, cfg))
+                          args=(i, tasks, requests, replies[i], results, cancel,
+                                dict(cfg, simulations=sims)))
               for i in range(worker_count)]
     evaluators = (Evaluator(model, device, mix=mix_vector(cfg)),
                   Evaluator(opponent, device, mix=mix_vector(cfg)))
@@ -271,9 +304,12 @@ def _batched_match(model, cfg, device, opponent, pairs, deadline, stop, sequenti
             done = drain()
             if sequential and done:
                 interim = summary(done, pairs * 2)
-                if interim["wilson_lower"] > 0.5 or interim["score_wilson_ci95"][1] <= 0.5:
-                    interim["sequential_decision"] = ("accept" if interim["wilson_lower"] > 0.5
-                                                       else "reject")
+                if interim["wilson_lower"] > 0.5:
+                    interim["sequential_decision"] = "accept"
+                    cancel.set()
+                elif (interim["score_wilson_ci95"][1] <= 0.5 or
+                      (best_case_wilson_lower(done, pairs) or 0.0) <= 0.5):
+                    interim["sequential_decision"] = "reject"
                     cancel.set()
             if stop() or time.monotonic() >= deadline:
                 cancel.set()
@@ -318,16 +354,19 @@ def _batched_match(model, cfg, device, opponent, pairs, deadline, stop, sequenti
     if sequential:
         if report["wilson_lower"] > 0.5:
             report["sequential_decision"] = "accept"
-        elif report["score_wilson_ci95"][1] <= 0.5:
+        elif (report["score_wilson_ci95"][1] <= 0.5 or
+              (best_case_wilson_lower(done, pairs) or 0.0) <= 0.5):
             report["sequential_decision"] = "reject"
     return report
 
 
 def match(model, cfg, device, opponent, pairs, deadline=float("inf"), stop=lambda: False,
-          sequential=False, client=None):
+          sequential=False, client=None, simulations=None):
     if not isinstance(opponent, str) and cfg.get("workers", 1) > 1:
-        return _batched_match(model, cfg, device, opponent, pairs, deadline, stop, sequential)
+        return _batched_match(model, cfg, device, opponent, pairs, deadline, stop, sequential,
+                              simulations=simulations)
     results = []
+    sims = int(simulations) if simulations else cfg["simulations"]
     stopped = lambda: stop() or time.monotonic() >= deadline
     mode = cfg.get("opening_mode", "sampled")
     book = load_book(cfg)
@@ -339,9 +378,9 @@ def match(model, cfg, device, opponent, pairs, deadline=float("inf"), stop=lambd
             rng = np.random.default_rng(4141+pair)
             g = start.copy()
             options = search_options(cfg)
-            ours = MCTS(Evaluator(model, device, mix=mix_vector(cfg)), cfg["simulations"],
+            ours = MCTS(Evaluator(model, device, mix=mix_vector(cfg)), sims,
                         cfg["cpuct"], **options)
-            theirs = MCTS(Evaluator(opponent, device, mix=mix_vector(cfg)), cfg["simulations"],
+            theirs = MCTS(Evaluator(opponent, device, mix=mix_vector(cfg)), sims,
                           cfg["cpuct"], **options) if not isinstance(opponent, str) else None
             try:
                 while g.adjudicate() is None:
@@ -369,7 +408,8 @@ def match(model, cfg, device, opponent, pairs, deadline=float("inf"), stop=lambd
             if interim["wilson_lower"] > 0.5:
                 interim["sequential_decision"] = "accept"
                 return interim
-            if interim["score_wilson_ci95"][1] <= 0.5:
+            if (interim["score_wilson_ci95"][1] <= 0.5 or
+                    (best_case_wilson_lower(results, pairs) or 0.0) <= 0.5):
                 interim["sequential_decision"] = "reject"
                 return interim
     return summary(results, pairs*2)

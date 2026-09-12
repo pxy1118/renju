@@ -21,7 +21,7 @@ Double-clicking again detects that the port is already in use and simply opens t
 .\.venv\Scripts\python.exe main.py webui --port 8766 --output runs
 ```
 
-The interface supports choosing the rule and your color, manually selecting the latest / historical best / several most recent checkpoints, 32/64/200 MCTS searches, a move counter, undoing the last round, restarting, and an end-of-game notice; at the end of a game the winning five stones are highlighted and the dot on the left of the status line becomes the winning side's piece (hidden on a draw), so "who won" is stated consistently in three places: text, piece, and line. The model drop-down lists the most recently written checkpoints for that rule (name, time, size), letting you revisit early training weights; if the selected file is removed by checkpoint rotation, it automatically falls back to "latest". Renju legality reuses the training rules; when no checkpoint exists, random weights are not passed off as a trained model — "Start Game" becomes "No model available" together with the reason.
+The interface supports choosing the rule and your color, manually selecting the latest / Champion / several most recent checkpoints, 32/64/200 MCTS searches, a move counter, undoing the last round, restarting, and an end-of-game notice; at the end of a game the winning five stones are highlighted and the dot on the left of the status line becomes the winning side's piece (hidden on a draw), so "who won" is stated consistently in three places: text, piece, and line. The model drop-down lists the most recently written checkpoints for that rule (name, time, size), letting you revisit early training weights; if the selected file is removed by checkpoint rotation, it automatically falls back to "latest". Renju legality reuses the training rules; when no checkpoint exists, random weights are not passed off as a trained model — "Start Game" becomes "No model available" together with the reason. During play the model also talks back: when it plays a four or a double threat, when its own search value says the game is clearly its, when you undo a move, and when it wins, a "Visk: ..." bubble pops up above the board — six situation pools, each drawn without repetition until the pool is used up, fading out after a few seconds.
 
 The Web UI always uses **CPU with a single inference thread**: it neither requests CUDA nor the training GPU lock, and it does not write to the training directory. It still consumes CPU and memory — a single service process has been measured at roughly a 550 MB resident working set and about 1.5 GB of private memory (including the CUDA-enabled PyTorch runtime), so running it alongside training causes memory contention. A new game loads the model saved at that moment, and the weights stay fixed for the whole game. Clicking "Restart" picks up an updated checkpoint. The service listens on localhost only by default, all browser tabs share a single board, and refreshing restores the current game; the game is not preserved after the service exits. While the model is thinking, wait for the move to finish before undoing or restarting. The client polls status every 250 ms while the model is thinking and every 1 second when idle, so even thinking times of a few hundred milliseconds show as "model thinking". When you run `python main.py webui` directly, the log is printed to the terminal. A model being trained does not mean mature playing strength already exists.
 
@@ -43,7 +43,7 @@ Startup prints something like:
 
 ```text
 Visk Web UI: http://127.0.0.1:8765 (CPU inference; training continues)
-分享链接（最多 10 桌）: http://192.168.1.3:8765/?k=<random string>
+分享链接（最多 10 桌，闲置 5 分钟自动释放）: http://192.168.1.3:8765/?k=<random string>
 观战链接（只读，不占棋桌）: http://192.168.1.3:8765/watch?w=<random string>
 ```
 
@@ -53,6 +53,7 @@ What sharing does and does not do:
 - **The watch link is read-only.** Opening `/watch?w=…` leads to a spectate page that mirrors every game in progress on the service (table picker, board, and move list, refreshed every second), but a spectator occupies no table seat and never sees the CSRF token, so every play route refuses them — watching cannot move a stone by construction. The watch string and the invite string are two independent keys that do not interchange.
 - **The link stays in the address bar only once.** The server exchanges `?k=` for a cookie and redirects to a clean `/`, so refreshes and back-navigation never carry the credential; the cookie is `HttpOnly` and `SameSite=Strict`.
 - **Ten tables at most by default** (`--max-sessions`, 1–16). Capacity is a resource limit, not a queue: every table holds its own network and search tree, so an eleventh visitor gets a 429 "share is full" page instead of displacing somebody's game. "End my table" in the page releases the slot. Memory is not the bottleneck — measured at roughly 16–30 MB per table (the network weights are only about 2 MB; the search tree dominates), so ten tables cost a few hundred MB. **CPU is what runs out first**: each table searches independently, so the more people think at once, the longer each of them waits.
+- **Idle tables release themselves.** "In use" means requests: an open page polls every second and is never mistaken for idle. Once the tab closes the requests stop, and a table quiet past `--table-ttl` (5 minutes by default, 0 disables) is released with its seat and memory handed back; a full share sweeps stale seats before refusing the next guest. The original browser is a stranger afterwards and needs the invite link again; unfinished games are not kept.
 - **Temporary by construction.** The invite string and every table live in memory only and die with the service; after Ctrl+C the guests' next poll simply fails.
 - **Trusted networks only.** The link is a ticket: whoever holds it can spend your CPU and memory (each table adds a network and a search tree, so memory grows with the table count). LAN sharing is fine; to expose this to the internet use `--public` below, which brings its own password.
 - With `--share` but the default host, the service still listens on 127.0.0.1 only; startup says so and suggests the `--host` value to use. With `--host` set to a LAN address but no `--share`, the service is a single table with **no credentials**, which is only appropriate on a network you trust.
@@ -69,7 +70,7 @@ The output looks like:
 
 ```text
 Visk Web UI: http://127.0.0.1:8765 (CPU inference; training continues)
-分享链接（最多 10 桌，进入时需输入口令）: http://192.168.1.3:8765/?k=<random>
+分享链接（最多 10 桌，闲置 5 分钟自动释放，进入时需输入口令）: http://192.168.1.3:8765/?k=<random>
 观战链接（只读，不占棋桌）: http://192.168.1.3:8765/watch?w=<random>
 正在为公网访问启动 Cloudflare 隧道（cloudflared 需能连上外网）……
 
@@ -86,7 +87,7 @@ Send players **the invite link and the password**; send spectators **the watch l
 - **The hostname changes on every restart**, and quick tunnels carry no uptime guarantee. Cloudflare itself warns that a new hostname "may take some time to be reachable" (about 20 seconds of DNS propagation in testing here). If cloudflared is not on PATH, pass `--cloudflared <path>` or run `winget install --id Cloudflare.cloudflared`.
 - **Ctrl+C takes the tunnel down with it**, so the public link stops working immediately. The tunnel process is owned by the service; no second window is needed.
 - `--public` cannot be combined with a specific interface address (cloudflared always dials `127.0.0.1`) and says so instead of failing obscurely; for another bind address use the manual route below.
-- **`--max-sessions` sets how many tables run at once** (10 by default, 16 maximum). Each holds its own network and search tree at roughly 16–30 MB, so memory is not the issue; CPU is, because ten concurrent searches slow every one of them down. Lower it when the machine struggles.
+- **`--max-sessions` sets how many tables run at once** (10 by default, 16 maximum). Each holds its own network and search tree at roughly 16–30 MB, so memory is not the issue; CPU is, because ten concurrent searches slow every one of them down. Lower it when the machine struggles. Tables nobody uses do not hold their seats: `--table-ttl` (5 minutes by default) releases them automatically, and 0 turns that off.
 
 ### Sharing through a Cloudflare tunnel (manual)
 

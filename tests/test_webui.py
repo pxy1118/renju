@@ -15,8 +15,9 @@ from vk.network import Network
 from vk.config import DEFAULTS
 from vk.storage import atomic_save
 from vk.tunnel import hostname_ok, link_hostname, parse_log_line
-from vk.webui import (LAN_SESSION_LIMIT, Sessions, Table, get_local_ipv4, make_server,
-                      proxy_patterns, serve, start_tunnel, trusted_host_match)
+from vk.webui import (DEFAULT_IDLE_TTL, LAN_SESSION_LIMIT, Sessions, Table, get_local_ipv4,
+                      make_server, proxy_patterns, serve, start_tunnel, taunt_category,
+                      trusted_host_match)
 
 
 def wait(table):
@@ -39,6 +40,17 @@ def wait_state(state_of):
     assert not state["busy"], state
     assert state["error"] is None, state
     return state
+
+
+def idle_past(seconds):
+    """Sleep until the monotonic clock really has moved ``seconds``.
+
+    The idle tests sit exactly at a ttl boundary, and time.sleep can return
+    early on Windows; the clock, not the sleep, is what the sweeper compares.
+    """
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        time.sleep(.005)
 
 
 @pytest.fixture
@@ -192,6 +204,91 @@ def test_human_win_is_reported_immediately(models):
         black = np.array(state["board"], np.int8)
         assert max(max(lengths(black, a, 1)) for a in range(225)
                    if state["board"][a] == 1) == 5
+    finally:
+        table.pool.shutdown()
+
+
+def taunt_position(blacks, whites, player):
+    """A fresh freestyle board with the given stones and side to move."""
+    game = Game("freestyle")
+    game.board[list(blacks)] = 1
+    game.board[list(whites)] = -1
+    game.player = player
+    return game
+
+
+def test_taunt_category_matrix():
+    """The classifier reads the board, not the search: exact threats dominate."""
+    human = -1  # the model plays black in every position below
+    # Open four: five spots on both ends (108 and 113), the human covers one.
+    assert taunt_category(taunt_position([109, 110, 111, 112], [15, 30, 45], -1), human) == "crushing"
+    # Four against the edge: a single five spot to block.
+    assert taunt_category(taunt_position([0, 1, 2, 3], [15, 30, 45], -1), human) == "threat"
+    # The human completes five on their own turn: no taunting.
+    assert taunt_category(taunt_position([105, 106, 107, 108], [0, 1, 2, 3], -1), human) is None
+    # Same board with the model to move: it just wins, and stays quiet until it does.
+    assert taunt_category(taunt_position([105, 106, 107, 108], [0, 1, 2, 3], 1), human) is None
+    # Human four with the model to parry: the pleading moment.
+    assert taunt_category(taunt_position([112], [0, 1, 2, 3], 1), human) == "panic"
+    # Without board threats the search's own value decides, above the threshold only.
+    quiet = taunt_position([112], [15], -1)
+    assert taunt_category(quiet, human, 0.95) == "dominant"
+    assert taunt_category(quiet, human, 0.5) is None
+    won = taunt_position([105, 106, 107, 108, 109], [15, 30, 45], 1)
+    won.winner = 1
+    assert taunt_category(won, human) == "win"
+    lost = taunt_position([0, 1, 2, 3, 4], [105, 106, 107, 108, 109], 1)
+    lost.winner = -1
+    assert taunt_category(lost, human) is None
+    drawn = taunt_position([105, 106, 107, 108, 109], [0, 1, 2, 3, 4], 1)
+    drawn.winner = 0
+    assert taunt_category(drawn, human) is None
+
+
+def test_taunt_flows_through_snapshot(models):
+    """Derived per snapshot: a four threatens, blocking resolves it, undo restores it."""
+    table = Table(models)
+    try:
+        assert table.snapshot()["taunt"] is None
+        table.new(dict(rule="freestyle", color="white", checkpoint="latest", simulations=32))
+        wait(table)  # the model opens as black; its opening stone is replaced below
+        # A black four against the edge (0-3) leaves exactly one five spot (4),
+        # and white to move must parry it.
+        with table.lock:
+            table.game = Game("freestyle")
+            table.game.board[[0, 1, 2, 3]] = 1
+            table.game.board[[15, 30, 45]] = -1
+            table.game.player = -1
+            table.history = [0, 15, 1, 30, 2, 45, 3]
+            table.refresh()
+        state = table.snapshot()
+        assert state["taunt"] == "threat"
+        table.act(dict(id=state["id"], action=4))
+        state = wait(table)
+        # The blocked four can no longer win for black, and one dead four is the
+        # only stone group on the board, so nothing but the value head could talk.
+        with table.lock:
+            table.last_value = None
+        assert table.snapshot()["taunt"] is None
+        # An open four (109-112) threatens both 108 and 113: the double kill.
+        with table.lock:
+            table.game = Game("freestyle")
+            table.game.board[[109, 110, 111, 112]] = 1
+            table.game.board[[15, 30, 45]] = -1
+            table.game.player = -1
+            table.history = [109, 15, 110, 30, 111, 45, 112]
+            table.refresh()
+        state = table.snapshot()
+        assert state["taunt"] == "crushing"
+        blocked = table.act(dict(id=state["id"], action=108))
+        # While the model is to move with its own five available it is silent,
+        # then the forced reply completes the five and the win line lands.
+        assert blocked["busy"] is True and blocked["taunt"] is None
+        state = wait(table)
+        assert state["winner"] == 1 and state["taunt"] == "win"
+        # Undo rewinds past the human's block; the double kill is derived again.
+        undone = table.act(dict(id=state["id"]), undo=True)
+        assert undone["winner"] is None and undone["taunt"] == "crushing"
     finally:
         table.pool.shutdown()
 
@@ -607,6 +704,70 @@ def test_watch_routes_need_a_shared_server(models):
         thread.join()
 
 
+def test_sweep_releases_only_idle_tables(models):
+    """The idle limit is per table: a browser still asking is left alone."""
+    sessions = Sessions(2, root=models, idle_ttl=0.05)
+    try:
+        first, second = sessions.open()[0], sessions.open()[0]
+        idle_past(0.08)
+        sessions.fetch(second)  # only the second browser is still around
+        assert sessions.sweep() == [first]
+        assert sessions.count() == 1
+        # The background reaper runs this same sweep on its own schedule.
+        deadline = time.monotonic() + 3
+        while sessions.count() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert sessions.count() == 0, "an abandoned table must not need a new guest to die"
+    finally:
+        sessions.shutdown()
+
+
+def test_a_full_share_hands_a_stale_seat_over_instead_of_refusing(models):
+    sessions = Sessions(1, root=models, idle_ttl=0.05)
+    try:
+        stale, _ = sessions.open()
+        idle_past(0.08)
+        token, _ = sessions.open()
+        assert token and token != stale, "sweep before refuse: the seat is reusable now"
+        assert sessions.count() == 1
+    finally:
+        sessions.shutdown()
+
+
+def test_an_abandoned_table_is_released_and_the_seat_reused(models):
+    """A closed tab stops polling, goes quiet, and its table is swept."""
+    host = get_local_ipv4()
+    if not host:
+        pytest.skip("no LAN address on this machine")
+    server = make_server(0, models, host=host, share=True, max_sessions=1, idle_ttl=0.1)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://{host}:{server.server_port}"
+    try:
+        guest = Browser(base)
+        guest.join(server.invite_key)
+        # A page that is open keeps polling, and polling is activity: well past
+        # the ttl the table survives because every request refreshes its stamp.
+        deadline = time.monotonic() + 0.3
+        while time.monotonic() < deadline:
+            guest.get("/api/state")
+        assert server.sessions.sweep() == [] and server.sessions.count() == 1
+        # The tab closes: nothing refreshes the stamp, the next sweep releases
+        # the table, this browser is a stranger again, and the seat is reusable.
+        idle_past(0.15)
+        server.sessions.sweep()
+        assert server.sessions.count() == 0
+        with pytest.raises(HTTPError) as err:
+            guest.get("/api/state")
+        assert err.value.code == 403
+        assert Browser(base).join(server.invite_key)["id"] is None
+    finally:
+        server.shutdown()
+        server.server_close()
+        server.sessions.shutdown()
+        thread.join()
+
+
 # The startup banner of a real cloudflared 2026.9.0 quick tunnel, verbatim. The
 # first https link in it is the terms of service, not the tunnel, which is what
 # makes "take the first URL you see" the wrong way to find the public address.
@@ -698,6 +859,23 @@ def test_start_tunnel_publishes_the_hostname_but_never_the_fence(monkeypatch):
     assert server.tunnel_host == BANNER_HOST
     assert server.tunnel is not None
     assert BANNER_HOST not in server.fence
+
+
+def test_share_banner_prints_the_idle_release(monkeypatch, capsys):
+    """The startup banner tells the operator how long a quiet seat is held."""
+    assert DEFAULT_IDLE_TTL == 5 * 60.0, "the default idle release is five minutes"
+    server = FakeServer()
+    server.sessions = type("S", (), {"maximum": 10, "idle_ttl": 1800.0,
+                                     "shutdown": lambda self: None})()
+    server.invite = lambda port: f"http://192.0.2.5:{port}/?k=test"
+    server.watch = lambda port: f"http://192.0.2.5:{port}/watch?w=test"
+    monkeypatch.setattr("vk.webui.make_server", lambda *a, **k: server)
+    serve(8765, "runs", open_browser=False, share=True, idle_ttl=1800.0)
+    out = capsys.readouterr().out
+    assert "分享链接（最多 10 桌，闲置 30 分钟自动释放）" in out
+    serve(8765, "runs", open_browser=False, share=True, idle_ttl=None)
+    out = capsys.readouterr().out
+    assert "闲置" not in out, "the banner promises nothing when auto-release is off"
 
 
 class FakeServer:

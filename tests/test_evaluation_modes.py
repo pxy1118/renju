@@ -123,3 +123,71 @@ def test_paired_delta_needs_shared_openings():
 def test_summary_rejects_an_incomplete_run():
     report = summary([{"result": 1, "color": 1, "winner": 1, "pair": 0}], 2)
     assert not report["complete"] and report["games"] == 1
+
+
+def _pair(result_black, result_white, pair=0):
+    return [{"result": result_black, "color": 1, "winner": result_black, "pair": pair},
+            {"result": result_white, "color": -1, "winner": result_white, "pair": pair}]
+
+
+def test_futility_bounds_a_hopeless_match():
+    from vk.evaluation import best_case_wilson_lower
+    # Eight of ten pairs lost outright: even sweeping the rest cannot lift the
+    # full-schedule Wilson lower bound over the 0.5 acceptance bar.
+    lost = [game for pair in range(8) for game in _pair(-1, -1, pair)]
+    assert best_case_wilson_lower(lost, 10) < 0.5
+    swept = [game for pair in range(8) for game in _pair(1, 1, pair)]
+    assert best_case_wilson_lower(swept, 10) > 0.5
+    assert best_case_wilson_lower(swept + _pair(1, 1, 8) + _pair(1, 1, 9), 10) is None
+
+
+def test_eval_simulations_resizes_only_the_arena_trees(monkeypatch):
+    import vk.evaluation as ev
+    seen = []
+    real = ev.MCTS
+
+    def spy(evaluator, simulations, cpuct, **options):
+        seen.append(simulations)
+        return real(evaluator, simulations, cpuct, **options)
+
+    monkeypatch.setattr(ev, "MCTS", spy)
+    match(Network("hybrid-8-1"), cfg(simulations=7), "cpu", Network("hybrid-8-1"),
+          pairs=1, simulations=3)
+    assert seen and set(seen) == {3}
+
+
+def test_match_hands_simulations_to_the_batched_path(monkeypatch):
+    import vk.evaluation as ev
+    captured = {}
+
+    def fake_batched(model, cfg, device, opponent, pairs, deadline, stop, sequential,
+                     simulations=None):
+        captured["simulations"] = simulations
+        return {"games": 0}
+
+    monkeypatch.setattr(ev, "_batched_match", fake_batched)
+    match(Network("hybrid-8-1"), cfg(simulations=5, workers=4), "cpu",
+          Network("hybrid-8-1"), pairs=1, simulations=3)
+    assert captured["simulations"] == 3
+
+
+def test_arena_tasks_follow_the_opening_mode(monkeypatch, tmp_path):
+    from test_opening_book import make_book
+    from vk.evaluation import _arena_tasks
+    from vk.game import Game
+
+    make_book(tmp_path / "book.json")
+    seen = []
+
+    def fake_opening(rule, seed, mode, plies, client=None, sample_plies=12, book=None):
+        seen.append((mode, book is not None))
+        return Game(rule)
+
+    monkeypatch.setattr("vk.evaluation.opening", fake_opening)
+    tasks = _arena_tasks(cfg(opening_mode="book",
+                             opening_book=str(tmp_path / "book.json")), 2)
+    assert seen == [("book", True), ("book", True)]
+    assert [pair for pair, _, _ in tasks] == [0, 0, 1, 1]
+    assert [color for _, color, _ in tasks] == [1, -1, 1, -1]
+    sampled = _arena_tasks(cfg(), 1)
+    assert sampled[0][2] is sampled[1][2] and len(sampled) == 2

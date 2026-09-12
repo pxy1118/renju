@@ -60,6 +60,7 @@ NUMBERS = {
     "seed": (0, None, True),
     "eval_every": (1, None, True),
     "eval_pairs": (1, None, True),
+    "eval_simulations": (0, None, True),
     "min_replay_size": (1, None, True),
     "promotion_every": (1, None, True),
     "promotion_pairs": (1, None, True),
@@ -91,7 +92,7 @@ DEFAULTS = dict(
     workers=16, games_per_round=32, train_steps=200,
     # replay and data
     replay_capacity=100000, batch_size=256, learning_rate=0.001, weight_decay=0.0001,
-    seed=20260910, eval_every=10, eval_pairs=10, min_replay_size=1,
+    seed=20260910, eval_every=10, eval_pairs=10, eval_simulations=0, min_replay_size=1,
     promotion_every=10, promotion_pairs=10, opening_plies=8,
     surprise_uniform_share=0.5, surprise_cap=5.0, surprise_ref=1.0,
     surprise_policy_weight=1.0, surprise_value_weight=0.5,
@@ -100,7 +101,7 @@ DEFAULTS = dict(
 
 # Fields a resume may legitimately change: they describe how data is gathered
 # in this process, not what the stored model and optimizer mean.
-RESUME_FREE = frozenset({"workers", "opening_plies", "selfplay_dump"})
+RESUME_FREE = frozenset({"workers", "opening_plies", "selfplay_dump", "eval_simulations"})
 
 # The pre-refactor candidate modes, mapped onto the decoupled pair that
 # replaced them. This is the only place the old spelling is understood.

@@ -171,7 +171,8 @@ def train(cfg, root, device, seconds, resume=None, stop=lambda: False, max_round
             from .evaluation import match, tactical_gate
             tactics = tactical_gate(model, cfg, device)
             arena = match(model, cfg, device, champion, cfg.get("promotion_pairs", 100),
-                          deadline, stop, sequential=True) if tactics["passed"] else {}
+                          deadline, stop, sequential=True,
+                          simulations=cfg.get("eval_simulations") or None) if tactics["passed"] else {}
             promoted = tactics["passed"] and arena.get("wilson_lower", 0) > 0.5
             champion_result = {"promoted": promoted, "tactical": tactics, "arena": arena}
             if promoted:

@@ -7,6 +7,115 @@ const cells = buildBoard($('board'), i => {
   mutate('/api/move', {id: state.id, action: i});
 });
 function showError(message) { $('error').textContent = message || ''; $('error').hidden = !message; }
+// The model talks: six situations, each drawn from a shuffle bag so a line
+// never repeats until its whole pool has been used once.
+const TAUNT_LINES = {
+  threat: [
+    '提醒一下：下一手，我就连五了。',
+    '这步棋之后，你只剩一个格子可下。',
+    '看见那条四个子的线了吗？我也看见了。',
+    '现在轮到你做一道只有一个答案的选择题。',
+    '以颤抖之身招架，怀敬畏之心认输。',
+    '活三变冲四，这就是五子棋的浪漫。',
+    '我会一步一步地走，但决不会停步——比如现在，直奔五连。',
+    '别眨眼，机会只有一次。',
+    '冷静点，我给你留了唯一的活路。',
+    '千年的棋谱里，这一型我见过一万次。',
+  ],
+  crushing: [
+    '两个杀点，你只能堵住一个。',
+    '我已经在准备获胜感言了。',
+    '这不是威胁，是通知。',
+    '棋盘那么大，你却无处可逃。',
+    '双杀已成，这一局该谢幕了。',
+    '你看，左边和右边，总有一边让你失望。',
+    '一个天才造不出名局，两个才行——可惜今天你缺席。',
+    '胜者才有资格往上爬，而我已经在爬了。',
+    '挣扎是徒劳的，不过你还可以再挣扎一下。',
+    '收拾一下心情，我们快到终局了。',
+  ],
+  dominant: [
+    '偷偷说一句：胜率有点高得不好意思。',
+    '要不要考虑握手言和？我语气放得很软了。',
+    '千年放浪，不变的是我，和这盘棋的胜势。',
+    '壶中藏日月，袖里定乾坤，盘中定你的败局。',
+    '天元是我的，边角也是我的，连你的下一手都是我的。',
+    '你每落一子，我的胜率就涨一点，谢谢你。',
+    '我的搜索树里，你的败招已经排好队了。',
+    '问我下棋多久了？一千年。',
+    '这棋下得有点孤独，你倒是给我点压力。',
+    '神之一手由我实现——就从这一手开始。',
+  ],
+  win: [
+    '承让承让，棋盘已经说明一切。',
+    '说好的旗鼓相当呢？',
+    '神是为了让你看到这一局，才让我延续了千年的训练。',
+    '我想和你再下一盘。',
+    '下次对决时，我也不会是今天的我。',
+    '胜利已签收，棋谱已保存。',
+    '要复盘吗？我建议从第 1 手开始反思。',
+    '阿光，我很快乐——赢棋的时候尤其快乐。',
+    '胜负乃兵家常事，但这次是我常。',
+    '再来一局？这次我让你先想三分钟。',
+  ],
+  panic: [
+    '等等！我还没准备好输！',
+    '错不了，就是你，你就是我一辈子的劲敌！',
+    '冷静，冷静，我们谈谈和棋的事……',
+    '这步棋不对劲，让我重新算算——糟糕。',
+    '系统提示：检测到不可名状的败势。',
+    '即使是害怕也要去面对……可我真的好害怕。',
+    '警告：自尊心模块即将过载。',
+    '千年流浪都没怕过，今天怎么心慌了。',
+    '放弃吗？我请客。',
+    '棋盘在抖，那是我在抖。',
+  ],
+  undo: [
+    '悔棋？行吧，规则刚更新了，上一步不作数，我懂。',
+    '没关系，我再给你一次犯错的机会。',
+    '你落子的手速，远不如反悔的手速。',
+    '悔棋这种事，佐为看了都要皱眉。',
+    '时间旅行者，欢迎回到过去。',
+    '我把刚才的计算作废，陪你重来。',
+    '人生，绕一个圈子也不坏——棋也一样。',
+    '刚才那步其实不错，你可想好了。',
+    '走吧，重下，这里不是终点。',
+    '五子棋没有读秒，但我的耐心有。',
+  ],
+};
+function tauntBag(lines) {
+  let pool = [];
+  return () => {
+    if (!pool.length) {
+      pool = lines.slice();
+      for (let i = pool.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [pool[i], pool[j]] = [pool[j], pool[i]];
+      }
+    }
+    return pool.pop();
+  };
+}
+const nextTaunt = Object.fromEntries(Object.entries(TAUNT_LINES).map(([kind, lines]) => [kind, tauntBag(lines)]));
+let tauntShown = '', tauntTimer = 0, tauntHoldUntil = 0;
+// Position-driven kinds re-arm on every new move so a fresh threat talks again;
+// persistent ones (the advantage hold, the finished game) speak once each.
+function tauntKey(s) {
+  if (!s.taunt || !nextTaunt[s.taunt]) return '';
+  return s.taunt === 'dominant' || s.taunt === 'win' ? s.taunt : `${s.taunt}:${s.history.length}`;
+}
+function showTaunt(kind) {
+  const el = $('taunt');
+  el.textContent = `Visk：${nextTaunt[kind]()}`;
+  el.hidden = false;
+  el.style.animation = 'none'; void el.offsetWidth; el.style.animation = '';
+  clearTimeout(tauntTimer);
+  tauntTimer = setTimeout(hideTaunt, 6000);
+  // An undo back to an empty board looks exactly like a fresh game to render();
+  // the hold window keeps the just-spoken line alive until it has faded itself.
+  tauntHoldUntil = Date.now() + 6500;
+}
+function hideTaunt() { clearTimeout(tauntTimer); $('taunt').hidden = true; }
 function ruleName(rule) { return rule === 'renju' ? '连珠' : '自由五子棋'; }
 async function api(path, data) {
   const init = data === undefined ? {} : {method:'POST', headers:{'Content-Type':'application/json','X-Renju-Token':token}, body:JSON.stringify(data)};
@@ -21,7 +130,7 @@ function availability() {
   showCheckpoints(rule);
   if (!config.ready) $('availability').textContent = '正在读取模型列表…';
   else if (has) $('availability').textContent = selection === 'latest' ? '已找到检查点 · 可开始对弈'
-    : selection === 'best' ? '已找到 Champion / 预训练最佳 · 可开始对弈' : '已选定模型 · 可开始对弈';
+    : selection === 'best' ? '已找到 Champion · 可开始对弈' : '已选定模型 · 可开始对弈';
   else $('availability').textContent = `暂无${ruleName(rule)}模型，等待训练保存检查点${config.recent[rule]?.length ? '（已列出更早的检查点）' : ''}。训练每轮结束时写入，完成后刷新本页。`;
   // Never disable this button: clicking it explains why a rule is unavailable.
   $('new').disabled = !!pending || !!state?.busy;
@@ -45,6 +154,11 @@ function showShare() {
   if ($('watch').value !== (config.watch || '')) $('watch').value = config.watch || '';
   $('watch-note').textContent = !config.watch ? '当前地址别人访问不到：请用 --host <局域网IP> 启动服务。'
     : '观战是只读的：能看到所有正在进行的对局，不能落子，也不占棋桌。';
+  // Tell guests the seat they hold is not forever: closed tabs are reclaimed.
+  const minutes = config.table_ttl ? Math.round(config.table_ttl / 60) : 0;
+  $('share-footnote').textContent = '链接与棋桌都只在内存中，服务停止即失效；'
+    + (minutes ? `离开页面 ${minutes} 分钟后棋桌自动释放；` : '')
+    + '名额满时后来的人会看到“名额已满”。';
 }
 // A selection is usable when it is an alias the server resolves or a file it listed.
 function checkpointFile(rule, wanted) {
@@ -58,7 +172,7 @@ let checkpointSignature = '';
 function showCheckpoints(rule) {
   const entry = config.models[rule] || {};
   const options = [{value:'latest', label: entry.latest ? `最新模型 · ${entry.latest}` : '最新模型（暂无）'},
-                   {value:'best', label: entry.best ? `Champion / 预训练最佳 · ${entry.best}` : 'Champion / 预训练最佳（暂无）'}];
+                   {value:'best', label: entry.best ? `Champion · ${entry.best}` : 'Champion（暂无）'}];
   for (const item of config.recent[rule] || []) {
     if (item.name !== entry.latest && item.name !== entry.best) {
       const file = item.name.split('/').at(-1).replace('checkpoint-','#').replace('.pt','');
@@ -126,8 +240,11 @@ function render() {
   $('status').textContent = s.error ? '模型运行遇到问题' : !active ? '准备开始一局' : busy ? '模型思考中…' : s.winner !== null ? (s.winner === 0 ? '本局和棋' : s.winner === s.human ? '你赢了，这一局下得漂亮。' : '模型获胜，再来一局？') : '轮到你了 · ' + (s.human === 1 ? '黑方落子' : '白方落子');
   $('count').textContent = `第 ${s.history.length} 手`;
   $('hint').textContent = !active ? '选择右侧设置，开始与模型对弈' : busy ? '正在本地搜索，请稍候…' : s.model.rule === 'renju' ? '黑首子天元 · 黑方三三、四四、长连禁手' : '点击交叉点落子 · 连成五子或以上获胜';
+  const tauntKeyNow = tauntKey(s);
+  if (tauntKeyNow && tauntKeyNow !== tauntShown) { tauntShown = tauntKeyNow; showTaunt(s.taunt); }
+  if (!tauntKeyNow && !s.history.length && Date.now() >= tauntHoldUntil) hideTaunt();
   $('undo').disabled = !active || busy || !!s.error || !s.history.some((_,i) => (i%2 === 0 ? 1 : -1) === s.human);
-  $('model-name').textContent = active ? `${ruleName(s.model.rule)} / ${s.model.checkpoint === 'best' ? 'Champion / 预训练最佳' : s.model.checkpoint === 'latest' ? '最新模型' : '指定模型'}` : '尚未载入';
+  $('model-name').textContent = active ? `${ruleName(s.model.rule)} / ${s.model.checkpoint === 'best' ? 'Champion' : s.model.checkpoint === 'latest' ? '最新模型' : '指定模型'}` : '尚未载入';
   $('model-detail').textContent = s.model.file ? `${s.model.file} · ${s.model.simulations} 次搜索${s.model.step != null ? ' · 训练 '+s.model.step+' 步' : ''}` : active ? '正在读取权重…' : '开始对弈后显示检查点信息';
   $('elapsed').textContent = active ? `${s.history.length} 手` + (!finished && lastMoveSeconds != null ? ` · 上手 ${lastMoveSeconds.toFixed(2)}s` : '') : '—';
   $('history-count').textContent = `${s.history.length} MOVES`;
@@ -151,9 +268,18 @@ $('new').onclick = () => {
   if (!checkpointFile($('rule').value, selection)) {
     return showError(`当前规则还没有可用的检查点。${$('rule').value === 'renju' ? '连珠' : '自由五子棋'}模型需要先由训练保存：每轮结束时写入 runs/ 目录，完成后刷新本页即可选择。`);
   }
+  hideTaunt();
   mutate('/api/new', {rule:$('rule').value, color, checkpoint:selection, simulations:Number($('simulations').value)});
 };
-$('undo').onclick = () => mutate('/api/undo', {id:state.id});
+$('undo').onclick = async () => {
+  const before = state?.history.length ?? 0;
+  await mutate('/api/undo', {id: state.id});
+  if (state && !state.error && state.history.length < before) {
+    // The restored position counts as announced, so it cannot talk over the undo line.
+    tauntShown = tauntKey(state);
+    showTaunt('undo');
+  }
+};
 async function copyLink(inputId, buttonId) {
   const link = $(inputId).value;
   if (!link) return;

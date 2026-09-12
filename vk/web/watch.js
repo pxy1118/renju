@@ -8,7 +8,7 @@ $('numbers').onchange = render;
 $('table').onchange = () => { chosen = $('table').value; render(); };
 
 function ruleName(rule) { return rule === 'renju' ? '连珠' : '自由五子棋'; }
-function checkpointLabel(name) { return name === 'best' ? 'Champion / 预训练最佳' : name === 'latest' ? '最新模型' : '指定模型'; }
+function checkpointLabel(name) { return name === 'best' ? 'Champion' : name === 'latest' ? '最新模型' : '指定模型'; }
 function showError(message) { $('error').textContent = message || ''; $('error').hidden = !message; }
 function seatLabel(t) {
   const over = t.winner !== null ? ' · 已结束' : t.error ? ' · 出错' : t.busy ? ' · 思考中' : '';

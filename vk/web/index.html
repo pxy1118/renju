@@ -8,6 +8,7 @@
 <div class="layout">
 <section class="play-area" aria-label="对弈棋盘">
 <div class="board-top"><div><span id="turn-dot" class="stone-icon black"></span><strong id="status" role="status" aria-live="polite">准备开始一局</strong></div><span id="count">第 0 手</span></div>
+<div id="taunt" role="status" aria-live="polite" hidden></div>
 <div class="board-frame"><div id="board" role="group" aria-label="十五路棋盘"></div></div>
 <div class="board-bottom"><span id="hint">选择右侧设置，开始与模型对弈</span><label><input type="checkbox" id="numbers" checked> 显示手数</label></div>
 </section>
@@ -29,7 +30,7 @@
 <div class="invite"><input id="watch" readonly aria-label="观战链接"><button id="watch-copy" class="secondary" type="button">复制</button></div>
 <p id="watch-note" class="muted"></p>
 <button id="leave" class="secondary" type="button">结束我的棋桌</button>
-<p class="footnote">链接与棋桌都只在内存中，服务停止即失效；名额满时后来的人会看到“名额已满”。</p></section>
+<p class="footnote" id="share-footnote">链接与棋桌都只在内存中，服务停止即失效；名额满时后来的人会看到“名额已满”。</p></section>
 </aside></div>
 <div id="error" role="alert" hidden></div>
 <footer><span>VISK / HUMAN × MACHINE</span><span>十五路棋盘 · 自我对弈学习</span></footer>

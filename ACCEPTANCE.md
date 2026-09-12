@@ -1,5 +1,11 @@
 # 实施与验收记录
 
+## Web UI 模型嘲讽气泡（2026-09-12）
+
+对弈页新增「Visk：……」气泡台词。后端 `vk/webui.py` 新增纯函数 `taunt_category()`，每次快照从局面直接派生类别：模型冲四（threat）、双杀（crushing）、搜索自评 value ≥ 0.9（dominant）、获胜补刀（win），以及玩家即胜在及时模型求饶（panic）；悔棋（undo）由前端在 `/api/undo` 成功后本地触发。派生式设计使类别随局面自动升降级——活四被堵一头即从 crushing 降为 threat，悔棋自动恢复此前类别，无需任何状态清理；轮到即胜一方本人行动时保持沉默，直接等终局。连珠禁手经 `immediate_wins`/`_legal_for_color` 处理，成五点为禁手点时不误报。前端每类台词一个洗牌袋（Fisher-Yates），同类不重复直到整池用完；气泡在棋盘上方 6 秒后淡出，绿色配色与橙色错误告警区分。
+
+自动测试当前为 **277 passed, 1 skipped**（新增 `test_taunt_category_matrix` 与 `test_taunt_flows_through_snapshot`，覆盖六类别判定、堵防后威胁消失、悔棋恢复与终局补刀）。观战页暂不渲染气泡；功能默认开启，未提供开关。
+
 ## Rapfi 教师蒸馏与战术 MCTS 改造（2026-09-10）
 
 已实现 freestyle 第一阶段的共享战术候选、外部 Rapfi MultiPV 适配器、安全 NPZ 教师数据、监督预训练、仅权重初始化、champion 自博弈/回滚和 Rapfi 对手评测。候选规则在 MCTS 每个节点执行，因此训练、CLI 和 Web UI 一致；日志新增候选数、强制胜防、搜索深度、相对先验 KL、价值绝对均值和晋级结果。
@@ -863,3 +869,18 @@ score 0.833（5 胜 1 负）  advantage +66.7 pp  CI95 [-90.2, +100]
 `tests/test_webui.py` 由 22 项增至 **24 项**（新增 `test_watch_link_mirrors_games_and_never_plays`、`test_watch_routes_need_a_shared_server`；代理 Host 用例补齐观战链接按来源生成；`serve` 用例断言公网横幅同时打印两条链接）。全量套件 **267 passed, 1 skipped**（改前 265）。
 
 实机复验（`artifacts/verification/watch-live.py`，真实服务 + headless Chrome）：0.0.0.0 共享实例上嘉宾经邀请链接开局、落子 H8，模型应手 D4；观战页 dump-dom 显示“桌 1 · 自由五子棋 · 第 2 手”、黑子已上盘、模型信息与落子记录齐全；对弈页“邀请与观战”面板给出可复制的观战链接。截图见 `artifacts/verification/watch-page.png`。
+
+## 闲置棋桌自动释放（2026-09-12 追加）
+
+需求：分享出去的棋桌如果客人直接关掉页面（没点“结束我的棋桌”），会一直占着名额与内存直到服务重启，应当闲置一段时间后自动释放。
+
+### 设计
+
+- **“正在使用”以请求为准**。每张桌已有 `touched` 时间戳（`Table.touch()`），而打开的页面每秒都在轮询 `/api/state`，每次已准入的请求都会刷新它——所以只有真正关掉的标签页（或网络断掉的浏览器）才会安静下来，不会误伤任何人。观战者的 `/api/watch` 不触碰任何棋桌，看棋不能替人保活。
+- **两条释放路径**：`Sessions` 自带一个后台回收线程（间隔 `min(60, ttl/2)` 秒，默认半小时上限一分钟一扫）；`Sessions.open()` 在满员时先清扫一遍再决定是否拒绝，让迟到的人不用等下一轮回收。判定与摘除在锁内一次完成，搜索线程池的关闭放到锁外（`wait=False`，局中在飞的一手照旧丢弃——与“结束我的棋桌”同一语义）。
+- **默认 5 分钟，`--table-ttl` 可调**（分钟；0 关闭自动释放）。最初实现取 30 分钟，按用户要求收紧为 5 分钟——反正开着页面的人每秒都在续期，只有关掉标签页的人才会计时，5 分钟足以覆盖手谈中的短暂离开。`make_server`/`serve` 透传 `idle_ttl`；`/api/config` 新增 `table_ttl` 字段，“邀请与观战”面板的脚注据此显示“离开页面 N 分钟后棋桌自动释放”；启动横幅的分享链接一栏带“闲置 5 分钟自动释放”；429 满员页文案改为“闲置的棋桌会自动让出，请稍后再试”（关闭自动释放时保留旧话术）。`Sessions.lock` 改为可重入锁，因为 `open()` 持锁期间要调 `sweep()`。
+- **被释放的浏览器没有特殊待遇**：Cookie 还在但会话已无，下一次请求与陌生人一样收到 403/邀请页提示，需要重新用邀请链接进入；未下完的棋局不保留——这正是“释放”的含义，也和“结束我的棋桌”一致。
+
+### 验证
+
+`tests/test_webui.py` 由 24 项增至 **28 项**：新增 `test_share_banner_prints_the_idle_release`（顺带把 `serve()` 的 `set_num_interop_threads` 调用改为可重入，同一进程内重复启动服务不再报错）、`test_sweep_releases_only_idle_tables`（只释放安静的那张桌，且后台回收线程会自行完成同样的事）、`test_a_full_share_hands_a_stale_seat_over_instead_of_refusing`（满员先清扫再拒绝）、`test_an_abandoned_table_is_released_and_the_seat_reused`（HTTP 全流程：持续轮询的客人跨过时限仍在、关页后清扫即释放、原浏览器变回陌生人 403、名额可被新人使用）。既有的满员 429 用例不变（刚入座的桌子不会被清扫）。全量套件 **275 passed, 1 skipped**。本次改动净增 4 项（267 → 271）；另有 4 项为 `test_evaluation_modes.py` 在两次会话之间新增（非本次改动），合计即为当前数。

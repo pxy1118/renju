@@ -12,6 +12,9 @@ printed as one ready-to-open link.
 Every share also prints a read-only ``/watch`` link. It mirrors every game in
 progress for spectators, who hold no table and no CSRF token, so watching can
 never move a stone or consume one of the seats.
+
+A shared table whose browser has gone quiet for ``--table-ttl`` minutes is
+released on its own, so a closed tab cannot hold a seat until restart.
 """
 from concurrent.futures import ThreadPoolExecutor
 from http import HTTPStatus
@@ -29,6 +32,7 @@ from urllib.parse import unquote_plus, urlparse
 import numpy as np
 import torch
 
+from .candidates import immediate_wins
 from .game import Game
 from .network import Network, Evaluator, architecture_of
 from .search import MCTS
@@ -41,6 +45,10 @@ ROOT = Path(__file__).resolve().parents[1]
 STATIC = Path(__file__).with_name("web")
 RULES = ("freestyle", "renju")
 RECENT_LIMIT = 8
+# Root value (the AI's own perspective) above which it considers the game clearly
+# its own and starts to talk. The board-threat categories below are exact; this
+# one is only the search's self-assessment, so it stays deliberately high.
+TAUNT_VALUE = 0.9
 CHECKPOINT_HELP = "请让训练保存检查点后再试（每轮结束时写入）。"
 # Concurrent guest tables. Each one holds its own network and MCTS tree, so the
 # cap bounds the service's memory and CPU rather than being a nicety: measured
@@ -49,6 +57,9 @@ CHECKPOINT_HELP = "请让训练保存检查点后再试（每轮结束时写入�
 # carries about 2.8 M parameters (~11 MB), which shifts that figure but leaves
 # the search tree and CPU contention as the binding constraints.
 LAN_SESSION_LIMIT = 10
+# A table whose browser has gone quiet this long is released: an open page
+# polls every second, so only an abandoned tab ever goes quiet.
+DEFAULT_IDLE_TTL = 5 * 60.0
 ALL_INTERFACES = "0.0.0.0"
 SESSION_COOKIE = "renju_session"
 WATCH_COOKIE = "renju_watch"
@@ -219,6 +230,32 @@ def watch_url(host, port, key):
     return f"http://{host}:{port}/watch?{WATCH_QUERY}={key}"
 
 
+def taunt_category(game, human, value=None):
+    """Classify the position for a taunt bubble, or None when silence fits.
+
+    Derived from the position alone every time the snapshot is taken, so the
+    field needs no bookkeeping: a blocked open four degrades from "crushing"
+    to "threat" and vanishes once the human answers it, and an undo simply
+    re-derives the earlier position. A threat is only spoken while the
+    threatened side must actually move -- the model brags when the human has
+    to parry, pleads when it has to parry itself, and stays quiet the moment
+    either side can just complete a five on its own turn.
+    """
+    if game.winner is not None:
+        return "win" if game.winner == -human else None
+    theirs = immediate_wins(game, human)
+    if theirs.any() and game.player == human:
+        return None
+    mine = immediate_wins(game, -human)
+    if mine.any():
+        return ("crushing" if int(mine.sum()) >= 2 else "threat") if game.player == human else None
+    if theirs.any():
+        return "panic"
+    if game.player == human and value is not None and value >= TAUNT_VALUE:
+        return "dominant"
+    return None
+
+
 class Table:
     def __init__(self, root=ROOT / "runs", catalog=None, sessions=0):
         self.root = Path(root)
@@ -233,13 +270,14 @@ class Table:
         self.info = {}
         self.legal = []
         self.seconds = None
+        self.last_value = None
         self.touched = time.monotonic()
         shared = catalog if catalog is not None else Catalog(self.root)
         self.catalog = shared.catalog
         self.entries = shared.entries
 
     def touch(self):
-        """Mark this table as just used, for the operator-facing activity view."""
+        """Mark this table as just used, for the activity view and idle release."""
         self.touched = time.monotonic()
 
     def catalog(self, rule):
@@ -290,6 +328,8 @@ class Table:
                         winner=self.game.winner if self.game else None,
                         human=getattr(self, "human", 1), legal=self.legal,
                         history=list(self.history), seconds=self.seconds,
+                        taunt=taunt_category(self.game, getattr(self, "human", 1),
+                                             self.last_value) if self.game else None,
                         sessions=self.sessions)
 
     def refresh(self):
@@ -319,6 +359,7 @@ class Table:
             self.game = Game(rule)
             self.human = 1 if color == "black" else -1
             self.history, self.error, self.seconds = [], None, None
+            self.last_value = None
             self.info = dict(rule=rule, checkpoint=requested,
                              latest=self.resolve(rule, "latest"), simulations=simulations, device="CPU")
             self.busy = True
@@ -368,6 +409,9 @@ class Table:
                 if action is not None:
                     self.history.append(action)
                     self.seconds = round(time.monotonic() - start, 2)
+                    # The search just ran for the position the model moved from;
+                    # its root value is the model's own assessment of the game.
+                    self.last_value = float(self.tree.last_result.value)
                 self.refresh()
                 self.busy = False
         except Exception as exc:
@@ -391,6 +435,7 @@ class Table:
                     self.game.move(action)
                 self.tree = MCTS(self.tree.evaluate, self.tree.simulations, self.tree.cpuct)
                 self.seconds = None
+                self.last_value = None
                 self.refresh()
             else:
                 action = data.get("action")
@@ -500,20 +545,36 @@ class Catalog:
 
 
 class Sessions:
-    """One private table per browser, with a hard capacity that never evicts.
+    """One private table per browser, with a capacity that is never stolen.
 
     Capacity is a resource limit, not a queue: every table holds its own network
     and search tree, so admitting a fourth player would quietly multiply the
     service's memory. A full share therefore turns the next guest away with an
     explanation instead of ending somebody's game.
+
+    What it does reclaim is seats nobody is using. A table whose browser has
+    not been heard from for the idle limit is released — by the background
+    reaper, or just before a full share refuses the next guest. An open page
+    polls every second, so only an abandoned tab ever goes quiet.
     """
 
-    def __init__(self, maximum=LAN_SESSION_LIMIT, catalog=None, root=ROOT / "runs"):
+    def __init__(self, maximum=LAN_SESSION_LIMIT, catalog=None, root=ROOT / "runs",
+                 idle_ttl=DEFAULT_IDLE_TTL):
         self.maximum = max(1, int(maximum))
+        self.idle_ttl = None if not idle_ttl else float(idle_ttl)
         self.catalog = catalog if catalog is not None else Catalog(root)
         self.root = self.catalog.root
-        self.lock = threading.Lock()
+        # Reentrant so open() can call sweep() while holding the lock.
+        self.lock = threading.RLock()
         self.tables = {}
+        self._stop = threading.Event()
+        if self.idle_ttl:
+            threading.Thread(target=self._reap, daemon=True).start()
+
+    def _reap(self):
+        interval = min(60.0, max(0.5, self.idle_ttl / 2))
+        while not self._stop.wait(interval):
+            self.sweep()
 
     def fetch(self, token):
         """The table that ``token`` owns, or None when it is unknown or gone."""
@@ -521,19 +582,38 @@ class Sessions:
             return None
         with self.lock:
             table = self.tables.get(token)
-        if table is not None:
-            table.touch()
+            if table is not None:
+                table.touch()
         return table
 
     def open(self):
-        """Create a table, or return None while the share is at capacity."""
+        """Create a table, or None while the share is at capacity."""
         with self.lock:
+            if len(self.tables) >= self.maximum:
+                # A stale tab holds its seat only until this sweep; after it,
+                # the late guest is admitted instead of refused.
+                self.sweep()
             if len(self.tables) >= self.maximum:
                 return None
             token = secrets.token_urlsafe(24)
             self.tables[token] = Table(self.root, catalog=self.catalog)
             self._renumber()
             return token, self.tables[token]
+
+    def sweep(self):
+        """Release every table idle past the limit; returns the tokens released."""
+        if not self.idle_ttl:
+            return []
+        with self.lock:
+            now = time.monotonic()
+            expired = [token for token, table in self.tables.items()
+                       if now - table.touched > self.idle_ttl]
+            dropped = [self.tables.pop(token) for token in expired]
+            self._renumber()
+        for table in dropped:
+            # Decided under the lock; the release happens outside of it.
+            table.pool.shutdown(wait=False)
+        return expired
 
     def close(self, token):
         """Drop one table (a guest leaving) without touching the others."""
@@ -555,6 +635,7 @@ class Sessions:
             return len(self.tables)
 
     def shutdown(self):
+        self._stop.set()
         with self.lock:
             tables, self.tables = list(self.tables.values()), {}
         for table in tables:
@@ -562,9 +643,10 @@ class Sessions:
 
 
 def make_server(port=8765, root=ROOT / "runs", host="127.0.0.1", share=False,
-                max_sessions=LAN_SESSION_LIMIT, password=None, trusted_hosts=()):
+                max_sessions=LAN_SESSION_LIMIT, password=None, trusted_hosts=(),
+                idle_ttl=DEFAULT_IDLE_TTL):
     catalog = Catalog(root)
-    sessions = Sessions(max_sessions, catalog) if share else None
+    sessions = Sessions(max_sessions, catalog, idle_ttl=idle_ttl) if share else None
     table = Table(root, catalog=catalog, sessions=1)
     request_token = secrets.token_hex(24)
     join_key = secrets.token_urlsafe(18)
@@ -831,9 +913,11 @@ def make_server(port=8765, root=ROOT / "runs", host="127.0.0.1", share=False,
                 opened = sessions.open()
                 if opened is None:
                     self.answered = True
+                    later = ("闲置的棋桌会自动让出，请稍后再试"
+                             if sessions.idle_ttl else "请稍后再试")
                     self.notice(HTTPStatus.TOO_MANY_REQUESTS, "棋间 · 名额已满",
                                 f"分享最多同时开 {sessions.maximum} 桌，现在都有人在用。"
-                                f"请稍后再试，或请服务提供者用 Ctrl+C 停止服务后重新开启。")
+                                f"{later}，或请服务提供者用 Ctrl+C 停止服务后重新开启。")
                     return None
                 token, mine = opened
                 self.answered = True
@@ -882,6 +966,7 @@ def make_server(port=8765, root=ROOT / "runs", host="127.0.0.1", share=False,
                                    max_sessions=sessions.maximum, password=bool(password),
                                    invite=self.public_invite() or invite(self.server.server_port),
                                    watch=self.public_watch() or watch(self.server.server_port),
+                                   table_ttl=idle_ttl,
                                    invite_reachable=guest_address() is not None)
                 return self.send(HTTPStatus.OK, payload)
             if path not in PLAYER_ASSETS:
@@ -946,11 +1031,15 @@ def make_server(port=8765, root=ROOT / "runs", host="127.0.0.1", share=False,
 
 def serve(port=8765, root=ROOT / "runs", open_browser=True, host="127.0.0.1", share=False,
           max_sessions=LAN_SESSION_LIMIT, password=None, trusted_hosts=(),
-          public=False, cloudflared=None, tunnel_timeout=40.0):
+          public=False, cloudflared=None, tunnel_timeout=40.0, idle_ttl=DEFAULT_IDLE_TTL):
     # Explicit CPU mode, with one inference thread per table to limit competition
-    # with self-play.
+    # with self-play. `set_num_interop_threads` refuses a second call in one
+    # process, which is what a repeated serve() would do.
     torch.set_num_threads(1)
-    torch.set_num_interop_threads(1)
+    try:
+        torch.set_num_interop_threads(1)
+    except RuntimeError:
+        pass
     if public:
         # The tunnel carries the page to strangers, so a shared instance without
         # a password would be an open board. One is minted here and printed with
@@ -958,7 +1047,7 @@ def serve(port=8765, root=ROOT / "runs", open_browser=True, host="127.0.0.1", sh
         # invent one before they can start.
         password = password or secrets.token_urlsafe(9)
     server = make_server(port, root, host=host, share=share, max_sessions=max_sessions,
-                         password=password, trusted_hosts=trusted_hosts)
+                         password=password, trusted_hosts=trusted_hosts, idle_ttl=idle_ttl)
     url = f"http://127.0.0.1:{server.server_port}"
     print(f"Visk Web UI: {url} (CPU inference; training continues)", flush=True)
     if share:
@@ -968,7 +1057,8 @@ def serve(port=8765, root=ROOT / "runs", open_browser=True, host="127.0.0.1", sh
                   f"请改用 --host {get_local_ipv4() or '<局域网IP>'} 后重试。", flush=True, file=sys.stderr)
         else:
             note = "，进入时需输入口令" if password else ""
-            print(f"分享链接（最多 {server.sessions.maximum} 桌{note}）: {link}", flush=True)
+            release = f"，闲置 {idle_ttl / 60:.0f} 分钟自动释放" if idle_ttl else ""
+            print(f"分享链接（最多 {server.sessions.maximum} 桌{release}{note}）: {link}", flush=True)
             print(f"观战链接（只读，不占棋桌）: {server.watch(server.server_port)}", flush=True)
     if public:
         print(f"正在为公网访问启动 Cloudflare 隧道（cloudflared 需能连上外网）……", flush=True)

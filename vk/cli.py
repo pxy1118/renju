@@ -76,6 +76,9 @@ def main():
     p.add_argument("--max-sessions", type=int, default=10,
                    help="concurrent shared tables (default 10; each costs tens of MB, "
                         "the CPU is what runs out first)")
+    p.add_argument("--table-ttl", type=float, default=5,
+                   help="minutes an unused shared table waits before it is released (default 5; "
+                        "0 keeps a table until the service stops)")
     p.add_argument("--password", help="optional access password for shared tables")
     p.add_argument("--trusted-host", action="append", default=[], metavar="AUTHORITY",
                    help="extra Host authority the UI accepts, for a reverse proxy (repeatable)")
@@ -144,6 +147,8 @@ def main():
         # table carries its own network and search tree.
         if not 1 <= args.max_sessions <= 16:
             p.error("--max-sessions must be between 1 and 16")
+        if args.table_ttl < 0:
+            p.error("--table-ttl must not be negative")
         if args.public:
             # A tunnel cannot reach a loopback-only server, and a public table is
             # never a single shared board: both are implied rather than asked for.
@@ -166,7 +171,8 @@ def main():
               password=args.password,
               trusted_hosts=[item for item in args.trusted_host if item],
               public=args.public, cloudflared=args.cloudflared,
-              tunnel_timeout=args.tunnel_timeout)
+              tunnel_timeout=args.tunnel_timeout,
+              idle_ttl=args.table_ttl * 60 if args.table_ttl > 0 else None)
         return
     if args.resume and args.init_checkpoint:
         p.error("--resume and --init-checkpoint are mutually exclusive")
