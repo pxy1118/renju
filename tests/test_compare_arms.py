@@ -9,7 +9,7 @@ import textwrap
 
 from vk.evaluation import evaluate_rapfi, paired_delta
 from vk.network import Network
-from vk.training import DEFAULTS
+from vk.config import DEFAULTS
 
 
 def fake_engine(path):
@@ -54,7 +54,7 @@ def run(tmp_path, engine, **overrides):
 
 def test_records_cover_every_pair_and_colour(tmp_path):
     engine = fake_engine(tmp_path / "engine.py")
-    report = run(tmp_path, engine, search="policy", candidates="legal")
+    report = run(tmp_path, engine, search="policy", hard_rules="none", search_bias="none")
     records = report["records"]
     assert len(records) == 4 == report["games"]
     assert {(record["pair"], record["color"]) for record in records} == {
@@ -65,8 +65,8 @@ def test_records_cover_every_pair_and_colour(tmp_path):
 
 def test_two_arms_are_paired_on_identical_openings(tmp_path):
     engine = fake_engine(tmp_path / "engine.py")
-    left = run(tmp_path, engine, search="policy", candidates="legal")
-    right = run(tmp_path, engine, search="policy", candidates="forced")
+    left = run(tmp_path, engine, search="policy", hard_rules="none", search_bias="none")
+    right = run(tmp_path, engine, search="policy", hard_rules="forced", search_bias="tactical")
     delta = paired_delta(left["records"], right["records"])
     assert delta["pairs"] == 4
     assert -100 <= delta["delta_pp"] <= 100
@@ -75,5 +75,5 @@ def test_two_arms_are_paired_on_identical_openings(tmp_path):
 
 def test_arms_without_shared_openings_are_not_comparable(tmp_path):
     engine = fake_engine(tmp_path / "engine.py")
-    report = run(tmp_path, engine, search="policy", candidates="legal")
+    report = run(tmp_path, engine, search="policy", hard_rules="none", search_bias="none")
     assert paired_delta(report["records"][:2], report["records"][2:]) is None

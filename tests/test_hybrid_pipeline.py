@@ -4,10 +4,16 @@ import textwrap
 import numpy as np
 import torch
 
+from vk.datasets import FORMAT_VERSION, read_shard
 from vk.game import Game
 from vk.pretraining import pretrain
+from vk.records import ACTION_NONE, VALUE_HEADS, SOURCE_TEACHER, head_mask
 from vk.teacher import generate_teacher_dataset
-from vk.training import DEFAULTS, load_checkpoint, train
+from vk.config import DEFAULTS
+from vk.storage import load_checkpoint
+from vk.training import train
+
+from conftest import collect_perf, game_stats, position_batch
 
 
 def dynamic_engine(path):
@@ -46,13 +52,15 @@ def test_small_teacher_generation_is_safe_and_exact(tmp_path):
                                         retries=0, shard_size=4)
     assert manifest["positions_written"] == 6
     assert manifest["rapfi_version"] == "dataset-fake"
-    assert manifest["format_version"] == 3
+    assert manifest["format_version"] == FORMAT_VERSION
+    assert manifest["value_heads"] == list(VALUE_HEADS)
     assert {item["path"] for item in manifest["engine_files"]} == {"config.toml", "weights.bin"}
     shards = list(output.rglob("*.npz"))
     assert shards
     with np.load(shards[0], allow_pickle=False) as shard:
         assert shard["state"].dtype == np.uint8 and shard["state"].shape[1:] == (3, 15, 15)
         assert shard["policy"].dtype == np.float16 and shard["policy"].shape[1] == 225
+        assert shard["value"].shape[1] == len(VALUE_HEADS)
         assert len(shard["state"]) <= 4
         # The stored per-action winrates must be the engine's raw numbers, not
         # the softmax-of-odds values the policy target is built from.
@@ -60,6 +68,13 @@ def test_small_teacher_generation_is_safe_and_exact(tmp_path):
         assert np.allclose(shard["teacher_topk_winrates"][0].astype(np.float64),
                            [0.8, 0.7, 0.6, 0.5, 0.4], atol=1e-3)
         assert not np.isclose(shard["policy"][0].max(), 0.8)
+    # A freshly generated teacher row knows its game result and its horizon
+    # targets; only a shard normalised from an old value file has to leave them
+    # unset, which tests/test_datasets.py pins separately.
+    rows = read_shard(shards[0])
+    assert (rows["source"] == SOURCE_TEACHER).all()
+    assert head_mask(rows, "final").all() and head_mask(rows, "short").any()
+    assert set(int(value) for value in rows["winner"]) <= {1, -1, 0}
 
 
 def make_dataset(root, rows=64):
@@ -98,11 +113,9 @@ def test_64_sample_overfit_save_and_weight_only_init(tmp_path, monkeypatch):
     assert report["test"]["top1"] == 1 and (pretrained / "best.pt").is_file()
 
     import vk.training as module
-    sample = [(Game().encode(), np.eye(1, 225, 112, dtype=np.float32)[0], 1.0)]
-    stats = {"winner": 1, "moves": [], "simulations": 1}
-    perf = {"seconds": 1, "batches": 1, "inference_positions": 1,
-            "average_inference_batch_size": 1, "largest_inference_batch_size": 1}
-    monkeypatch.setattr(module, "collect", lambda *args: (sample, [stats], perf))
+    sample = position_batch(1, policy=np.eye(1, 225, 112, dtype=np.float32)[0])
+    monkeypatch.setattr(module, "collect",
+                        lambda *args: (sample, [game_stats()], collect_perf()))
     cfg = dict(DEFAULTS, arch="hybrid-8-1", channels=8, blocks=1,
                simulations=1, workers=1,
                games_per_round=1, train_steps=1, batch_size=1, replay_capacity=10,

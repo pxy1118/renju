@@ -11,7 +11,9 @@ from .game import Game
 from .network import (ARCHITECTURES, Network, Evaluator, architecture,
                       architecture_of, device_check, parameter_count)
 from .search import MCTS
-from .training import DEFAULTS, STRING_OPTIONS, train, checkpoint_path, load_checkpoint
+from .config import from_file, mix_vector  # noqa: F401  (mix_vector used by play)
+from .storage import checkpoint_path, load_checkpoint
+from .training import train
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -45,37 +47,8 @@ def gpu_lock(device):
 
 
 def read_config(path, rule):
-    cfg = dict(DEFAULTS)
-    if path:
-        values = json.loads(Path(path).read_text(encoding="utf-8-sig"))
-        if set(values)-set(cfg):
-            raise ValueError(f"Unknown configuration keys: {set(values)-set(cfg)}")
-        cfg.update(values)
-    cfg["rule"] = rule
-    for k, v in cfg.items():
-        if k in ("rule", "arch", "opening_book"):
-            # ``opening_book`` is a path or None; its existence is checked by
-            # whoever loads it, which fails loudly before any game starts.
-            continue
-        if k in STRING_OPTIONS:
-            if v not in STRING_OPTIONS[k]:
-                raise ValueError(f"Invalid configuration: {k}={v!r} "
-                                 f"(known: {list(STRING_OPTIONS[k])})")
-            continue
-        if not isinstance(v,(float,int)) or isinstance(v,bool) or v < 0:
-            raise ValueError(f"Invalid configuration: {k}")
-    if cfg["arch"] not in ARCHITECTURES:
-        raise ValueError(f"Unknown architecture: {cfg['arch']!r} "
-                         f"(known: {sorted(ARCHITECTURES)})")
-    width, pattern, _ = architecture(cfg["arch"])
-    if cfg["channels"] != width or cfg["blocks"] != len(pattern):
-        raise ValueError(f"channels/blocks disagree with {cfg['arch']}: "
-                         f"expected {width}/{len(pattern)}, "
-                         f"got {cfg['channels']}/{cfg['blocks']}")
-    for k in ("channels", "blocks", "simulations", "workers", "games_per_round", "train_steps", "replay_capacity", "batch_size", "eval_every", "eval_pairs", "min_replay_size", "promotion_every", "promotion_pairs"):
-        if not isinstance(cfg[k],int) or cfg[k] < 1:
-            raise ValueError(f"{k} must be a positive integer")
-    return cfg
+    """Configuration parsing lives in vk/config; this is the CLI entry point."""
+    return from_file(path, rule)
 
 
 def display(g):
@@ -132,9 +105,12 @@ def main():
                    help="draw pretraining batches with a weight set by the teacher's "
                         "top-1/top-2 winrate gap, so decision-critical positions get "
                         "more of the budget (needs format-3 top-k data)")
-    p.add_argument("--candidate-mode", choices=["tactical","forced","legal"],
-                   help="candidate set for search: tactical keeps square3_line4 pruning, "
-                        "forced keeps only wins/blocks, legal keeps every legal point")
+    p.add_argument("--hard-rules", choices=["forced","none"],
+                   help="deterministic tactics that may exclude legal points: forced keeps "
+                        "complete-a-five and block-a-five, none keeps every legal point")
+    p.add_argument("--search-bias", choices=["none","tactical"],
+                   help="soft prior bias for forcing fours and the local neighbourhood; "
+                        "never removes a legal point")
     p.add_argument("--search", choices=["mcts","policy"],
                    help="how the model picks a move: MCTS+value, or the raw policy argmax")
     p.add_argument("--opening-mode", choices=["sampled","teacher","book","none"],
@@ -148,7 +124,10 @@ def main():
     p.add_argument("--steps", type=int, default=20000)
     p.add_argument("--engine")
     p.add_argument("--engine-dir")
-    p.add_argument("--opponent", choices=["suite", "rapfi", "checkpoint"], default="suite")
+    p.add_argument("--opponent", choices=["suite", "rapfi", "checkpoint", "self-policy"],
+                   default="suite",
+                   help="who the model plays: the fixed suite, Rapfi, a checkpoint, or "
+                        "its own raw policy (measuring what search adds)")
     p.add_argument("--opponent-checkpoint")
     p.add_argument("--engine-workers", type=int, default=4)
     p.add_argument("--engine-threads", type=int, default=4)
@@ -210,7 +189,8 @@ def main():
     # Explicit flags win over both the configuration file and the checkpoint's
     # stored config, so one run directory can be evaluated under several
     # decoupled switches without editing JSON or writing a new checkpoint.
-    overrides = {key: value for key, value in (("candidates", args.candidate_mode),
+    overrides = {key: value for key, value in (("hard_rules", args.hard_rules),
+                                               ("search_bias", args.search_bias),
                                                ("search", args.search),
                                                ("opening_mode", args.opening_mode),
                                                ("opening_book", args.opening_book))
@@ -257,6 +237,7 @@ def main():
             (logits.square().mean()+value.square().mean()).backward()
             print(json.dumps({"arch": model.arch, "pattern": model.pattern,
                               "width": model.width, "heads": model.heads,
+                              "value_heads": list(model.value_heads),
                               "blocks": model.blocks, "parameters": parameter_count(model)}),
                   flush=True)
             print("Network CUDA forward/backward OK", flush=True)
@@ -282,7 +263,8 @@ def main():
             model = Network(cfg["arch"]).to(args.device)
             model.eval()
             start = time.monotonic()
-            data, games, perf = collect(cfg, Evaluator(model,args.device), range(10000),
+            data, games, perf = collect(cfg, Evaluator(model, args.device, mix=mix_vector(cfg)),
+                                        range(10000),
                                         start+args.minutes*60, lambda: stopping[0])
             # Separate directory, never writes to runs/.
             dest = Path(args.output) if args.output else ROOT / "artifacts" / f"benchmark-{args.rule}-{time.time_ns()}"
@@ -312,6 +294,14 @@ def main():
                               lambda: stopping[0], args.engine_threads, args.engine_hash_mb,
                               args.max_nodes, args.engine_timeout,
                               args.opening_seed if args.opening_seed is not None else 91823)}
+                elif args.opponent == "self-policy":
+                    # The same weights, once with search and once without: the
+                    # one measurement that says whether search adds anything.
+                    from .evaluation import evaluate_search_gap
+                    report = {"search_gap": evaluate_search_gap(
+                        model, cfg, args.device, args.pairs,
+                        time.monotonic() + args.minutes * 60, lambda: stopping[0],
+                        args.opening_seed if args.opening_seed is not None else 91823)}
                 elif args.opponent == "checkpoint":
                     if not args.opponent_checkpoint:
                         p.error("Checkpoint evaluation requires --opponent-checkpoint")
@@ -330,8 +320,9 @@ def main():
             else:
                 g = Game(args.rule)
                 human = 1 if args.human_color == "black" else -1
-                tree = MCTS(Evaluator(model,args.device),cfg["simulations"],cfg["cpuct"],
-                            candidates=cfg.get("candidates", "tactical"))
+                from .evaluation import search_options
+                tree = MCTS(Evaluator(model, args.device, mix=mix_vector(cfg)),
+                            cfg["simulations"], cfg["cpuct"], **search_options(cfg))
                 while g.adjudicate() is None:
                     display(g)
                     if g.player == human:

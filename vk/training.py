@@ -1,148 +1,71 @@
+"""The self-play training loop: collect a round, update, evaluate, checkpoint.
+
+The loop owns three things and delegates the rest: it decides when a round runs
+and when parameters move, it keeps the promoted champion, and it writes one
+metrics record per round. Search lives in vk/search, targets in vk/targets, the
+loss in vk/objective, storage in vk/storage and the round diagnostics in
+vk/diagnostics.
+"""
 import json
-import os
 from pathlib import Path
 import random
 import time
 import copy
-from collections import deque
 import numpy as np
 import torch
-from .network import DEFAULT_ARCH, Network, Evaluator, architecture_of
+
+from .config import mix_vector, resume_incompatible
+from .diagnostics import record_round, target_report
+from .network import Evaluator, Network, architecture_of
+from .objective import compute_loss, require_multi_head, tensor_batch
+from .records import augment_batch, blank
+from .replay import ReplayBuffer
 from .selfplay import collect
-
-DEFAULTS = dict(rule="freestyle", arch=DEFAULT_ARCH, channels=128, blocks=10,
-                simulations=200, cpuct=2.0,
-                candidates="tactical", search="mcts", opening_mode="sampled",
-                opening_book=None,
-                temperature_moves=20, workers=16, games_per_round=32, train_steps=200,
-                replay_capacity=100000, batch_size=256, learning_rate=0.001,
-                weight_decay=0.0001, seed=20260910, eval_every=10, eval_pairs=10,
-                min_replay_size=1, promotion_every=10, promotion_pairs=10,
-                opening_plies=8)
-
-# Which string-valued configuration keys exist and what they may be set to.
-STRING_OPTIONS = {"candidates": ("tactical", "forced", "legal"),
-                  "search": ("mcts", "policy"),
-                  "opening_mode": ("sampled", "teacher", "book", "none")}
-
-# Fields a resume may legitimately change: both describe how data is gathered
-# in this process, not what the stored model and optimizer mean.
-RESUME_FREE_FIELDS = {"workers", "opening_plies"}
+from .storage import (append_json, atomic_save, checkpoint_path, load_checkpoint,
+                      load_model_state, reconcile_jsonl, save, save_best)
 
 
-def augment(x, pi, rotation, mirror):
-    x = np.rot90(x, rotation, axes=(-2, -1))
-    pi = np.rot90(pi.reshape(15,15), rotation)
-    if mirror:
-        x, pi = x[..., ::-1], pi[:, ::-1]
-    return x.copy(), pi.reshape(225).copy()
-
-
-def update(model, optimizer, replay, batch_size, device, rng):
-    indices = rng.integers(len(replay), size=batch_size)
-    xs, ps, zs = [], [], []
-    for i in indices:
-        x, pi, z = replay[int(i)]
-        x, pi = augment(x, pi, int(rng.integers(4)), bool(rng.integers(2)))
-        xs.append(x)
-        ps.append(pi)
-        zs.append(z)
-    x = torch.tensor(np.stack(xs), dtype=torch.float32, device=device)
-    pi = torch.tensor(np.stack(ps), dtype=torch.float32, device=device)
-    pi = pi / pi.sum(dim=1, keepdim=True)
-    z = torch.tensor(zs, dtype=torch.float32, device=device)
+def update(model, optimizer, replay, cfg, device, rng):
+    """One optimisation step over a surprise-weighted replay batch."""
+    batch = replay.sample(cfg["batch_size"], rng, cfg)
+    states, policies = augment_batch(batch["state"], batch["policy"], rng)
+    tensors = tensor_batch(batch, device, states, policies)
     model.train()
-    logits, values = model(x)
-    policy_loss = -(pi * torch.log_softmax(logits, dim=1)).sum(dim=1).mean()
-    value_loss = (z-values).square().mean()
-    loss = policy_loss + value_loss
-    if not torch.isfinite(loss):
-        raise RuntimeError("Non-finite training loss")
+    logits, values = model(tensors["state"])
+    report = compute_loss(logits, values, tensors, cfg)
     optimizer.zero_grad(set_to_none=True)
-    loss.backward()
+    report["loss"].backward()
     torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
     optimizer.step()
-    probs = torch.softmax(logits.detach(), dim=1)
-    entropy = -(probs * torch.log_softmax(logits.detach(), dim=1)).sum(1).mean()
-    return {"loss": float(loss.detach()), "policy_loss": float(policy_loss.detach()),
-            "value_loss": float(value_loss.detach()), "policy_entropy": float(entropy)}
+    metrics = {key: value for key, value in report.items()
+               if isinstance(value, (int, float, type(None)))}
+    metrics["loss"] = float(report["loss"].detach())
+    metrics["policy_loss"] = float(report["policy_loss"].detach())
+    metrics["value_loss"] = float(report["value_loss"].detach())
+    weights = batch["weight"].astype(np.float64) if len(batch) else np.zeros(1)
+    metrics["batch_weight_mean"] = float(weights.mean())
+    metrics["batch_weight_max"] = float(weights.max())
+    metrics["batch_full_search_share"] = float((batch["full_search"] != 0).mean()) if len(batch) else 0.0
+    return metrics
 
 
-def atomic_save(data, path):
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temp = path.with_suffix(path.suffix + ".tmp")
-    with temp.open("wb") as f:
-        torch.save(data, f)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(temp, path)
-
-
-def checkpoint_path(root, name):
-    root = Path(root)
-    if name == "latest":
-        paths = sorted(root.glob("checkpoint-*.pt"))
-        if not paths:
-            raise FileNotFoundError(f"No checkpoint in {root}")
-        return paths[-1]
-    if name == "best":
-        return root / "best.pt"
-    return Path(name)
-
-
-def load_checkpoint(path, rule):
-    # Local trusted checkpoints only: optimizer/RNG/replay require pickle.
-    state = torch.load(path, map_location="cpu", weights_only=False)
-    if state.get("format") != 1 or state["config"]["rule"] != rule:
-        raise ValueError("Checkpoint format or rule mismatch")
-    return state
-
-
-def save(root, cfg, model, optimizer, replay, rng, round_id, step, total_games, pending_steps=0,
-         champion_model=None, champion_optimizer=None, champion_step=0, teacher=None):
-    state = {"format": 1, "config": cfg, "model": model.state_dict(), "optimizer": optimizer.state_dict(),
-             "replay": list(replay), "round": round_id, "step": step, "total_games": total_games,
-             "pending_steps": pending_steps,
-             "rng": rng.bit_generator.state, "python_rng": random.getstate(),
-             "torch_rng": torch.get_rng_state(),
-             "cuda_rng": torch.cuda.get_rng_state_all() if next(model.parameters()).is_cuda else None}
-    state.update({"candidate_mode": cfg.get("candidates", "tactical"),
-                  "champion_model": champion_model, "champion_optimizer": champion_optimizer,
-                  "champion_step": champion_step, "teacher": teacher})
-    path = Path(root) / f"checkpoint-{round_id:08d}-{step:010d}.pt"
-    atomic_save(state, path)
-    for old in sorted(Path(root).glob("checkpoint-*.pt"))[:-3]:
-        old.unlink()
-    return path
-
-
-def append_json(path, record):
-    with Path(path).open("a", encoding="utf-8") as f:
-        f.write(json.dumps(record, ensure_ascii=False) + "\n")
-
-
-def reconcile_jsonl(path, committed_round):
-    """Remove diagnostics written after the checkpoint selected for resume."""
-    path = Path(path)
-    if not path.exists():
-        return 0
-    kept, removed = [], 0
-    for line in path.read_text(encoding="utf-8-sig").splitlines():
-        try:
-            record = json.loads(line)
-        except ValueError:
-            removed += 1
-            continue
-        if record.get("round", -1) <= committed_round:
-            kept.append(line)
-        else:
-            removed += 1
-    if removed:
-        temporary = path.with_suffix(path.suffix + ".reconcile.tmp")
-        temporary.write_text("\n".join(kept) + ("\n" if kept else ""), encoding="utf-8")
-        os.replace(temporary, path)
-    return removed
+def head_line(targets, network):
+    """The handful of numbers worth reading at a glance in metrics.jsonl."""
+    final = targets.get("target_saturation_final", {})
+    return {
+        "value_target_abs_mean_final": final.get("mean_abs"),
+        "value_target_abs_gt_0.9_share_final": final.get("abs_gt_0.9_share"),
+        "value_target_abs_lt_0.5_share_final": final.get("abs_lt_0.5_share"),
+        "policy_entropy_target": targets.get("policy_target_entropy"),
+        "policy_entropy_network": network.get("policy_entropy_network"),
+        "kl_target_prior": targets.get("policy_surprise_mean"),
+        "kl_target_network": network.get("kl_target_network"),
+        "q_spread_mean": targets.get("q_spread_mean"),
+        "policy_valid_share": targets.get("policy_valid_share"),
+        "full_search_share": targets.get("full_search_share"),
+        "sample_weight_mean": targets.get("sample_weight_mean"),
+        "sample_weight_max": targets.get("sample_weight_max"),
+    }
 
 
 def train(cfg, root, device, seconds, resume=None, stop=lambda: False, max_rounds=None,
@@ -157,26 +80,21 @@ def train(cfg, root, device, seconds, resume=None, stop=lambda: False, max_round
     if state:
         if "optimizer" not in state:
             raise ValueError("Inference-only best checkpoint cannot resume training; use latest.")
-        # Older checkpoints predate fields added to DEFAULTS since; compare them
-        # at their current default rather than reporting a spurious mismatch.
-        stored = {key: state["config"].get(key, value) for key, value in DEFAULTS.items()}
-        stored.update({key: value for key, value in state["config"].items()
-                       if key not in DEFAULTS})
-        stored["arch"] = architecture_of(state["config"])
-        changed = {key for key in set(cfg) | set(stored) if cfg.get(key) != stored.get(key)}
-        incompatible = changed - RESUME_FREE_FIELDS
+        incompatible = resume_incompatible(cfg, state["config"])
         if incompatible:
-            raise ValueError(f"Resume configuration differs in incompatible fields: {sorted(incompatible)}")
+            raise ValueError(f"Resume configuration differs in incompatible fields: "
+                             f"{sorted(incompatible)}")
     random.seed(cfg["seed"])
     torch.manual_seed(cfg["seed"])
     rng = np.random.default_rng(cfg["seed"])
-    model = Network(cfg["arch"]).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=cfg["learning_rate"], weight_decay=cfg["weight_decay"])
-    replay = deque(maxlen=cfg["replay_capacity"])
+    model = require_multi_head(Network(cfg["arch"])).to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=cfg["learning_rate"],
+                                 weight_decay=cfg["weight_decay"])
+    replay = ReplayBuffer(cfg["replay_capacity"])
     round_id = step = total_games = pending_steps = 0
     teacher = None
     if init_checkpoint:
-        initial = load_checkpoint(checkpoint_path(root, init_checkpoint), cfg["rule"])
+        initial = load_model_state(checkpoint_path(root, init_checkpoint), cfg["rule"])
         if architecture_of(initial["config"]) != cfg["arch"]:
             raise ValueError("Initial checkpoint architecture mismatch")
         if initial.get("pretrain_report") and not initial["pretrain_report"].get("accepted"):
@@ -186,9 +104,9 @@ def train(cfg, root, device, seconds, resume=None, stop=lambda: False, max_round
     if state:
         model.load_state_dict(state["model"])
         optimizer.load_state_dict(state["optimizer"])
-        replay.extend(state["replay"])
+        replay = ReplayBuffer.from_state(cfg["replay_capacity"], state["replay"])
         round_id, step, total_games = state["round"], state["step"], state["total_games"]
-        pending_steps = state.get("pending_steps",0)
+        pending_steps = state.get("pending_steps", 0)
         rng.bit_generator.state = state["rng"]
         random.setstate(state["python_rng"])
         torch.set_rng_state(state["torch_rng"])
@@ -213,26 +131,24 @@ def train(cfg, root, device, seconds, resume=None, stop=lambda: False, max_round
     (root / "config.json").write_text(json.dumps(cfg, indent=2), encoding="utf-8")
     start = time.monotonic()
     deadline = start + seconds
-    evaluator = Evaluator(champion, device)
+    evaluator = Evaluator(champion, device, mix=mix_vector(cfg))
     minimum = cfg.get("min_replay_size", 1)
     if not (root / "best.pt").exists():
-        atomic_save({"format": 1, "config": cfg, "model": champion_state,
-                     "step": champion_step, "teacher": teacher,
-                     "candidate_mode": cfg.get("candidates", "tactical")}, root / "best.pt")
+        save_best(root, cfg, champion_state, champion_step, teacher)
     rounds_this_run = 0
     last_path = None
     while time.monotonic() < deadline and not stop():
         if max_rounds is not None and rounds_this_run >= max_rounds:
             break
         rounds_this_run += 1
-        games = []
-        perf = {"inference_positions":0,"batches":0,"average_inference_batch_size":0,
-                "largest_inference_batch_size":0,"seconds":0}
+        games, records = [], blank(0)
+        perf = {"inference_positions": 0, "batches": 0, "average_inference_batch_size": 0,
+                "largest_inference_batch_size": 0, "seconds": 0}
         if pending_steps == 0:
             round_id += 1
-            seeds = rng.integers(0, 2**32, cfg["games_per_round"])
-            data, games, perf = collect(cfg, evaluator, seeds, deadline, stop)
-            replay.extend(data)
+            seeds = rng.integers(0, 2 ** 32, cfg["games_per_round"])
+            records, games, perf = collect(cfg, evaluator, seeds, deadline, stop)
+            replay.extend(records)
             total_games += len(games)
             for game in games:
                 append_json(root / "games.jsonl", {"round": round_id, **game})
@@ -244,7 +160,7 @@ def train(cfg, root, device, seconds, resume=None, stop=lambda: False, max_round
             for _ in range(pending_steps):
                 if stop() or time.monotonic() >= deadline:
                     break
-                metrics = update(model, optimizer, replay, cfg["batch_size"], device, rng)
+                metrics = update(model, optimizer, replay, cfg, device, rng)
                 step += 1
                 updates += 1
                 pending_steps -= 1
@@ -263,48 +179,54 @@ def train(cfg, root, device, seconds, resume=None, stop=lambda: False, max_round
                 champion_optimizer = copy.deepcopy(optimizer.state_dict())
                 champion_step = step
                 champion.load_state_dict(champion_state)
-                atomic_save({"format": 1, "config": cfg, "model": champion_state,
-                             "step": champion_step, "teacher": teacher,
-                             "candidate_mode": cfg.get("candidates", "tactical")}, root / "best.pt")
+                save_best(root, cfg, champion_state, champion_step, teacher)
             else:
                 model.load_state_dict(champion_state)
                 optimizer.load_state_dict(champion_optimizer)
             append_json(root / "evaluations.jsonl", {"round": round_id, **champion_result})
-        last_path = save(root, cfg, model, optimizer, replay, rng, round_id, step, total_games,
-                         pending_steps, champion_state, champion_optimizer, champion_step, teacher)
+        last_path = save(root, cfg, model, optimizer, replay.to_state(), rng, round_id, step,
+                         total_games, pending_steps, champion_state, champion_optimizer,
+                         champion_step, teacher)
+
         def average(name):
             values = [game.get(name) for game in games if game.get(name) is not None]
             return float(np.mean(values)) if values else None
-        # Opening length is the number of moves that preceded search, i.e. what
-        # balanced_opening supplied. Samples cover only the searched moves.
+
+        targets = target_report(records) if len(records) else {}
+        network = record_round(model, records, cfg, device, rng=rng) if len(records) else {}
         openings = [len(game["opening"]) for game in games if game.get("opening") is not None]
-        mean_opening = float(np.mean(openings)) if openings else None
         record = {"round": round_id, "step": step, "updates": updates, "games": len(games),
-                  "total_games": total_games, "replay_size": len(replay), "pending_steps":pending_steps,
+                  "total_games": total_games, "replay_size": len(replay),
+                  "pending_steps": pending_steps,
                   "trainable": trainable, "min_replay_size": minimum,
                   "opening_distinct": len({tuple(g["opening"]) for g in games if g.get("opening")}),
-                  "opening_sample_size": mean_opening,
-                  "elapsed_seconds": time.monotonic()-start, "remaining_seconds": max(0,deadline-time.monotonic()),
+                  "opening_sample_size": float(np.mean(openings)) if openings else None,
+                  "elapsed_seconds": time.monotonic() - start,
+                  "remaining_seconds": max(0, deadline - time.monotonic()),
                   "black_wins": sum(g["winner"] == 1 for g in games),
                   "white_wins": sum(g["winner"] == -1 for g in games),
                   "draws": sum(g["winner"] == 0 for g in games),
-                  "black_win_rate": sum(g["winner"] == 1 for g in games)/len(games) if games else None,
-                  "white_win_rate": sum(g["winner"] == -1 for g in games)/len(games) if games else None,
-                  "draw_rate": sum(g["winner"] == 0 for g in games)/len(games) if games else None,
+                  "black_win_rate": sum(g["winner"] == 1 for g in games) / len(games) if games else None,
+                  "white_win_rate": sum(g["winner"] == -1 for g in games) / len(games) if games else None,
+                  "draw_rate": sum(g["winner"] == 0 for g in games) / len(games) if games else None,
                   "candidate_count_mean": average("candidate_count_mean"),
                   "forced_win_count": sum(g.get("forced_win_count", 0) for g in games),
                   "forced_defense_count": sum(g.get("forced_defense_count", 0) for g in games),
-                  "strategic_count": sum(g.get("strategic_count", 0) for g in games),
+                  "bias_moves_mean": average("bias_moves_mean"),
                   "search_max_depth": max((g.get("search_max_depth", 0) for g in games), default=0),
-                  "search_prior_kl_mean": average("search_prior_kl_mean"),
-                  "value_abs_mean": average("value_abs_mean"),
+                  "cheap_search_share": average("cheap_search_share"),
+                  "horizon_bootstrap_share": average("horizon_bootstrap_share"),
                   "champion": champion_result,
-                  "completed_game_simulations_per_second": sum(g["simulations"] for g in games)/max(perf["seconds"], 1e-6),
-                  **perf, **metrics}
+                  "completed_game_simulations_per_second":
+                      sum(g["simulations"] for g in games) / max(perf["seconds"], 1e-6),
+                  "diagnostics": {"targets": targets, "network": network,
+                                  "replay": replay.stats(cfg)},
+                  **head_line(targets, network), **perf, **metrics}
         append_json(root / "metrics.jsonl", record)
         print(json.dumps(record), flush=True)
     if last_path is None:
-        last_path = save(root, cfg, model, optimizer, replay, rng, round_id, step, total_games,
-                         pending_steps, champion_state, champion_optimizer, champion_step, teacher)
+        last_path = save(root, cfg, model, optimizer, replay.to_state(), rng, round_id, step,
+                         total_games, pending_steps, champion_state, champion_optimizer,
+                         champion_step, teacher)
     return {"checkpoint": str(last_path), "step": step, "total_games": total_games,
-            "elapsed_seconds": time.monotonic()-start}
+            "elapsed_seconds": time.monotonic() - start}

@@ -17,7 +17,7 @@ from vk.game import Game
 from vk.network import Network
 from vk.pretraining import pretrain
 from vk.rapfi import RapfiAnalysis, RapfiMove
-from vk.training import atomic_save
+from vk.storage import atomic_save
 
 
 class FakeRapfi:
@@ -76,7 +76,8 @@ def test_dagger_output_is_standard_v3_with_a_diagnostics_sidecar(tmp_path, monke
         pass
     args = Args()
     for key, value in dict(positions=6, games=8, seed=7, rule="freestyle", search="policy",
-                           candidates="forced", simulations=4, cpuct=2.0, opening_plies=4,
+                           hard_rules="forced", search_bias="none", simulations=4, cpuct=2.0,
+               opening_plies=4,
                            annotation_multipv=5, max_nodes=1000, threads=1, hash_mb=8,
                            timeout=5.0, regret_threshold=0.05, shard_size=4, device="cpu",
                            engine="engine.py", engine_dir=str(tmp_path),
@@ -119,7 +120,8 @@ def test_dagger_data_merges_and_trains_alongside_the_teacher_set(tmp_path, monke
         pass
     args = Args()
     for key, value in dict(positions=6, games=8, seed=3, rule="freestyle", search="policy",
-                           candidates="forced", simulations=4, cpuct=2.0, opening_plies=4,
+                           hard_rules="forced", search_bias="none", simulations=4, cpuct=2.0,
+               opening_plies=4,
                            annotation_multipv=5, max_nodes=1000, threads=1, hash_mb=8,
                            timeout=5.0, regret_threshold=0.05, shard_size=4, device="cpu",
                            engine="engine.py", engine_dir=str(tmp_path),

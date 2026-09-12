@@ -6,8 +6,12 @@ import pytest
 import torch
 from vk.game import Game
 from vk.network import Network, Evaluator
-from vk.training import DEFAULTS, train, load_checkpoint, checkpoint_path
+from vk.config import DEFAULTS
+from vk.storage import checkpoint_path, load_checkpoint
+from vk.training import train
 from vk.selfplay import collect
+
+from conftest import collect_perf, game_stats, position_batch
 
 
 @pytest.mark.parametrize("rule", ["freestyle","renju"])
@@ -32,11 +36,9 @@ def test_resume_allows_worker_count_change(tmp_path,monkeypatch):
     import vk.training as module
     cfg = dict(DEFAULTS,arch="hybrid-8-1",channels=8,blocks=1,simulations=1,workers=1,
                games_per_round=1,train_steps=1,batch_size=2,replay_capacity=300)
-    data = [(Game().encode(),np.full(225,1/225),1.0)]
-    monkeypatch.setattr(module,"collect",lambda *args: (data,[{"winner":1,"moves":[],"simulations":1}],
-                                                       {"seconds":1,"batches":1,"inference_positions":1,
-                                                        "average_inference_batch_size":1,
-                                                        "largest_inference_batch_size":1}))
+    data = position_batch(1)
+    monkeypatch.setattr(module, "collect",
+                        lambda *args: (data, [game_stats()], collect_perf()))
     first = train(cfg,tmp_path,"cpu",30,max_rounds=1)
     changed = dict(cfg,workers=2)
     second = train(changed,tmp_path,"cpu",30,resume="latest",max_rounds=1)
@@ -50,20 +52,19 @@ def test_resume_tolerates_a_checkpoint_predating_new_config_fields(tmp_path, mon
     its current default instead of being reported as a configuration mismatch.
     """
     import vk.training as module
+    from vk.storage import atomic_save
     cfg = dict(DEFAULTS, arch="hybrid-8-1", channels=8, blocks=1, simulations=1, workers=1,
                games_per_round=1, train_steps=1, batch_size=2, replay_capacity=300)
-    data = [(Game().encode(), np.full(225, 1/225), 1.0)]
-    stats = {"winner": 1, "moves": [], "simulations": 1, "opening": []}
-    perf = {"seconds": 1, "batches": 1, "inference_positions": 1,
-            "average_inference_batch_size": 1, "largest_inference_batch_size": 1}
-    monkeypatch.setattr(module, "collect", lambda *args: (data, [stats], perf))
+    data = position_batch(1)
+    monkeypatch.setattr(module, "collect",
+                        lambda *args: (data, [game_stats()], collect_perf()))
 
     first = train(cfg, tmp_path, "cpu", 30, max_rounds=1)
     state = load_checkpoint(first["checkpoint"], "freestyle")
     # Reproduce an old checkpoint: drop the field the new code knows about.
     older = {key: value for key, value in state["config"].items() if key != "opening_plies"}
     assert "opening_plies" not in older
-    module.atomic_save({**state, "config": older}, tmp_path / "older.pt")
+    atomic_save({**state, "config": older}, tmp_path / "older.pt")
 
     resumed = train(dict(cfg, opening_plies=6), tmp_path, "cpu", 30,
                     resume=str(tmp_path / "older.pt"), max_rounds=1)
@@ -104,7 +105,7 @@ def test_stop_saves_no_fake_outcome(tmp_path):
     cfg = dict(DEFAULTS,arch="hybrid-8-1",channels=8,blocks=1)
     result = train(cfg,tmp_path,"cpu",10,stop=lambda:True)
     state = load_checkpoint(result["checkpoint"],"freestyle")
-    assert state["total_games"] == 0 and state["replay"] == [] and state["step"] == 0
+    assert state["total_games"] == 0 and len(state["replay"]) == 0 and state["step"] == 0
 
 
 def test_worker_error_is_propagated():
@@ -117,9 +118,9 @@ def test_worker_error_is_propagated():
 def test_resume_finishes_pending_updates_before_new_games(tmp_path,monkeypatch):
     import vk.training as module
     cfg = dict(DEFAULTS,arch="hybrid-8-1",channels=8,blocks=1,train_steps=3,batch_size=2)
-    data = [(Game().encode(),np.full(225,1/225),1.0)]
-    monkeypatch.setattr(module,"collect",lambda *args: (data,[{"winner":1,"moves":[],"simulations":1}],
-                                                       {"seconds":1,"batches":1,"inference_positions":1}))
+    data = position_batch(1)
+    monkeypatch.setattr(module, "collect",
+                        lambda *args: (data, [game_stats()], collect_perf()))
     original = module.update
     calls = [0]
     def counted(*args):

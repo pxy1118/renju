@@ -6,11 +6,12 @@ import time
 import traceback
 import numpy as np
 from .game import Game, lengths
-from .network import Network, Evaluator, architecture_of
+from .network import Inference, Network, Evaluator, architecture_of
 from .openings import balanced_opening, book_opening, load_opening_book, sampled_opening
-from .search import MCTS, SearchStopped, policy_move
-from .training import load_checkpoint
-from .candidates import immediate_wins, tactical_candidates
+from .search import MCTS, SearchStopped, policy_move, prior_options, search_options
+from .config import mix_vector
+from .storage import load_checkpoint
+from .candidates import hard_candidates, immediate_wins
 
 
 def wilson_interval(score, games, z=1.959963984540054):
@@ -82,17 +83,15 @@ def load_book(cfg):
     return load_opening_book(path, rule=cfg.get("rule"))
 
 
-def play_move(game, model, evaluator, cfg, search="mcts", candidates=None, tree=None,
-              stop=lambda: False):
+def play_move(game, model, evaluator, cfg, search="mcts", tree=None, stop=lambda: False):
     """One move by the model: either MCTS+value or the raw policy ranking."""
-    candidates = candidates or cfg.get("candidates", "tactical")
     if search == "policy":
-        action, _ = policy_move(game, evaluator, candidates)
+        action, _ = policy_move(game, evaluator, **prior_options(cfg))
         return action
     if search != "mcts":
         raise ValueError(f"Unknown search mode: {search!r} (known: ['mcts', 'policy'])")
     if tree is None:
-        tree = MCTS(evaluator, cfg["simulations"], cfg["cpuct"], candidates=candidates)
+        tree = MCTS(evaluator, cfg["simulations"], cfg["cpuct"], **search_options(cfg))
     return int(np.argmax(tree.policy(game, stop=stop)))
 
 
@@ -130,12 +129,13 @@ def search_statistics(results):
         return float(np.mean(values)) if values else None
     modes = {}
     for move in moves:
-        modes[move.get("candidate_mode")] = modes.get(move.get("candidate_mode"), 0) + 1
-    statistics = {"moves": len(moves), "candidate_mode_hist": modes,
+        modes[move.get("hard_mode")] = modes.get(move.get("hard_mode"), 0) + 1
+    statistics = {"moves": len(moves), "hard_mode_hist": modes,
                   "ply_median": float(np.median(
                       [len(record.get("moves", [])) for record in results if record.get("moves")]))}
     for key in ("candidate_count", "value_abs_mean", "search_prior_kl", "root_visited_moves",
-                "root_max_visit_share", "root_visit_entropy", "mean_visits_per_visited_move"):
+                "root_max_visit_share", "root_visit_entropy", "mean_visits_per_visited_move",
+                "q_spread", "root_value"):
         value = mean(key)
         if value is not None:
             statistics[f"{key}_mean" if key != "candidate_count" else "candidate_count_mean"] = value
@@ -185,7 +185,8 @@ def _arena_actor(worker, tasks, requests, response, results, cancel, cfg):
             requests.put((worker, model_id, state))
             while not cancel.is_set():
                 try:
-                    return response.get(timeout=0.2)
+                    policy, value = response.get(timeout=0.2)
+                    return Inference.leaf_value(policy, value)
                 except queue.Empty:
                     pass
             raise SearchStopped()
@@ -196,8 +197,11 @@ def _arena_actor(worker, tasks, requests, response, results, cancel, cfg):
                 return
             pair, color, start = task
             game = start.copy()
-            ours = MCTS(lambda state: evaluate(0, state), cfg["simulations"], cfg["cpuct"])
-            theirs = MCTS(lambda state: evaluate(1, state), cfg["simulations"], cfg["cpuct"])
+            options = search_options(cfg)
+            ours = MCTS(lambda state: evaluate(0, state), cfg["simulations"], cfg["cpuct"],
+                        **options)
+            theirs = MCTS(lambda state: evaluate(1, state), cfg["simulations"], cfg["cpuct"],
+                          **options)
             try:
                 while game.adjudicate() is None:
                     tree = ours if game.player == color else theirs
@@ -231,7 +235,8 @@ def _batched_match(model, cfg, device, opponent, pairs, deadline, stop, sequenti
     actors = [ctx.Process(target=_arena_actor,
                           args=(i, tasks, requests, replies[i], results, cancel, cfg))
               for i in range(worker_count)]
-    evaluators = (Evaluator(model, device), Evaluator(opponent, device))
+    evaluators = (Evaluator(model, device, mix=mix_vector(cfg)),
+                  Evaluator(opponent, device, mix=mix_vector(cfg)))
     records = {}
     reported = 0
     cancelled_at = None
@@ -293,8 +298,9 @@ def _batched_match(model, cfg, device, opponent, pairs, deadline, stop, sequenti
                 selected = [item for item in batch if item[1] == model_id]
                 if not selected:
                     continue
-                logits, values = evaluators[model_id].batch([item[2] for item in selected])
-                for (worker, _, _), policy, value in zip(selected, logits, values):
+                inference = evaluators[model_id].batch([item[2] for item in selected])
+                for (worker, _, _), policy, value in zip(selected, inference.policy,
+                                                        inference.leaf()):
                     replies[worker].put((policy, float(value)))
         done = drain()
     finally:
@@ -332,8 +338,11 @@ def match(model, cfg, device, opponent, pairs, deadline=float("inf"), stop=lambd
                 return summary(results, pairs*2)
             rng = np.random.default_rng(4141+pair)
             g = start.copy()
-            ours = MCTS(Evaluator(model, device), cfg["simulations"], cfg["cpuct"])
-            theirs = MCTS(Evaluator(opponent, device), cfg["simulations"], cfg["cpuct"]) if not isinstance(opponent,str) else None
+            options = search_options(cfg)
+            ours = MCTS(Evaluator(model, device, mix=mix_vector(cfg)), cfg["simulations"],
+                        cfg["cpuct"], **options)
+            theirs = MCTS(Evaluator(opponent, device, mix=mix_vector(cfg)), cfg["simulations"],
+                          cfg["cpuct"], **options) if not isinstance(opponent, str) else None
             try:
                 while g.adjudicate() is None:
                     if stopped():
@@ -366,6 +375,84 @@ def match(model, cfg, device, opponent, pairs, deadline=float("inf"), stop=lambd
     return summary(results, pairs*2)
 
 
+def evaluate_search_gap(model, cfg, device, pairs, deadline=float("inf"), stop=lambda: False,
+                        opening_seed=91823):
+    """The same checkpoint against itself, with and without search.
+
+    This is the measurement the whole search stack exists for: if MCTS plus the
+    value head cannot beat the raw policy prior on identical balanced openings,
+    then the search is not adding information, however healthy its diagnostics
+    look. One game per colour per opening, so the two arms face the same
+    positions and the paired interval is meaningful.
+    """
+    results, moves_detail = [], []
+    rule = cfg.get("rule", "freestyle")
+    mode = cfg.get("opening_mode", "sampled")
+    book = load_book(cfg)
+    stopped = lambda: stop() or time.monotonic() >= deadline
+    evaluator = Evaluator(model, device, mix=mix_vector(cfg))
+    for pair in range(pairs):
+        start = opening(rule, opening_seed + pair, mode, cfg.get("opening_plies", 8),
+                        book=book)
+        for color in (1, -1):
+            if stopped():
+                return _search_gap_report(results, moves_detail, pairs, opening_seed)
+            game = start.copy()
+            tree = MCTS(evaluator, cfg["simulations"], cfg["cpuct"], **search_options(cfg))
+            detail = []
+            try:
+                while game.adjudicate() is None:
+                    if stopped():
+                        raise SearchStopped()
+                    searching = game.player == color
+                    action = play_move(game, model, evaluator, cfg,
+                                       "mcts" if searching else "policy", tree, stopped)
+                    if searching:
+                        stats = tree.last_stats
+                        detail.append({"hard_mode": stats["hard_mode"],
+                                       "q_spread": stats["q_spread"],
+                                       "root_value": stats["root_value"],
+                                       "search_prior_kl": stats["search_prior_kl"],
+                                       "root_visited_moves": stats["root_visited_moves"],
+                                       "root_max_visit_share": stats["root_max_visit_share"],
+                                       "root_visit_entropy": stats["root_visit_entropy"]})
+                    else:
+                        detail.append({"hard_mode": "policy_only"})
+                    game.move(action, validate=False)
+                    tree.advance(action, game)
+            except SearchStopped:
+                # The budget ran out inside a search: report the finished games
+                # rather than a broken run, exactly as an arena match does.
+                return _search_gap_report(results, moves_detail, pairs, opening_seed)
+            results.append({"result": game.winner * color, "color": color,
+                            "winner": game.winner, "pair": pair, "moves": list(game.history),
+                            "moves_detail": detail,
+                            "searching_color": color})
+            moves_detail.append(detail)
+            print(f"search-gap games={len(results)}/{pairs * 2}", flush=True)
+    return _search_gap_report(results, moves_detail, pairs, opening_seed)
+
+
+def _search_gap_report(results, moves_detail, pairs, opening_seed=None):
+    report = summary(results, pairs * 2)
+    low, high = report["paired_score_ci95"]
+    report.update({
+        "search_mode": "mcts", "baseline": "policy",
+        "opening_seed": opening_seed,
+        # The two arms are complementary within a pair, so the advantage is the
+        # paired score doubled around zero and the interval transforms with it.
+        # With no completed game there is no advantage to report: publishing
+        # -100 for an unfinished run would read as a catastrophic result.
+        "search_advantage_pp": (2 * report["score"] - 1) * 100 if report["games"] else None,
+        "search_advantage_ci95_pp": [(2 * low - 1) * 100, (2 * high - 1) * 100]
+        if report["games"] else None,
+        "reading": ("positive means MCTS plus the value head scored higher than the "
+                    "raw policy prior on identical openings; an interval covering "
+                    "zero means the search added nothing measurable"),
+    })
+    return report
+
+
 def tactical_gate(model, cfg, device, mode="mcts"):
     positions = []
     for dr, dc in ((0, 1), (1, 0), (1, 1), (1, -1)):
@@ -379,18 +466,17 @@ def tactical_gate(model, cfg, device, mode="mcts"):
     positions.append((gap, immediate_wins(gap)))
     defense = Game(cfg["rule"])
     defense.board[105:109] = -1
-    positions.append((defense, tactical_candidates(defense).mask))
+    positions.append((defense, hard_candidates(defense, "forced").mask))
     correct = 0
-    evaluator = Evaluator(model, device)
+    evaluator = Evaluator(model, device, mix=mix_vector(cfg))
     for game, accepted in positions:
         if mode == "policy":
             # A policy-only checkpoint has an untrained value head, so routing
             # the gate through MCTS would test what was deliberately skipped.
-            action, _ = policy_move(game, evaluator, "forced")
+            action, _ = policy_move(game, evaluator, "forced", bias="none")
         else:
             action = int(np.argmax(MCTS(evaluator, max(1, min(8, cfg["simulations"])),
-                                        cfg["cpuct"], candidates=cfg.get("candidates", "tactical")
-                                        ).policy(game)))
+                                        cfg["cpuct"], **search_options(cfg)).policy(game)))
         correct += int(accepted[action])
     return {"correct": correct, "total": len(positions), "accuracy": correct / len(positions),
             "mode": mode, "passed": correct == len(positions)}
@@ -421,14 +507,15 @@ def evaluate_rapfi(model, cfg, device, engine, engine_dir, pairs,
     from .rapfi import RapfiClient
     results = []
     search = cfg.get("search", "mcts")
-    candidates = cfg.get("candidates", "tactical")
+    options = search_options(cfg)
     mode = cfg.get("opening_mode", "sampled")
     book = load_book(cfg)
     stopped = lambda: stop() or time.monotonic() >= deadline
 
     def finish():
         report = summary(results, pairs * 2)
-        report.update({"search_mode": search, "candidates": candidates, "opening_mode": mode,
+        report.update({"search_mode": search, "opening_mode": mode,
+                       "hard_rules": options["hard_rules"], "search_bias": options["bias"],
                        "opening_seed": opening_seed, "max_nodes": max_nodes,
                        "opening_book": str(cfg.get("opening_book")) if book else None,
                        "simulations": cfg["simulations"] if search == "mcts" else 0})
@@ -450,19 +537,23 @@ def evaluate_rapfi(model, cfg, device, engine, engine_dir, pairs,
                 if stopped():
                     return finish()
                 game = start.copy()
-                evaluator = Evaluator(model, device)
-                tree = MCTS(evaluator, cfg["simulations"], cfg["cpuct"], candidates=candidates) \
-                    if search == "mcts" else None
+                evaluator = Evaluator(model, device, mix=mix_vector(cfg))
+                tree = MCTS(evaluator, cfg["simulations"], cfg["cpuct"],
+                            **search_options(cfg)) if search == "mcts" else None
                 moves_detail = []
                 while game.adjudicate() is None:
                     if stopped():
                         return finish()
                     if game.player == color:
-                        action = play_move(game, model, evaluator, cfg, search, candidates, tree, stopped)
+                        action = play_move(game, model, evaluator, cfg, search, tree, stopped)
                         if tree is not None:
                             stats = tree.last_stats
                             moves_detail.append({"candidate_count": stats["candidate_count"],
-                                                 "candidate_mode": stats["candidate_mode"],
+                                                 "hard_mode": stats["hard_mode"],
+                                                 "hard_rules": stats["hard_rules"],
+                                                 "search_bias": stats["search_bias"],
+                                                 "q_spread": stats["q_spread"],
+                                                 "root_value": stats["root_value"],
                                                  "value_abs_mean": stats["value_abs_mean"],
                                                  "search_prior_kl": stats["search_prior_kl"],
                                                  "root_visited_moves": stats["root_visited_moves"],
@@ -471,7 +562,7 @@ def evaluate_rapfi(model, cfg, device, engine, engine_dir, pairs,
                                                  "mean_visits_per_visited_move":
                                                      stats["mean_visits_per_visited_move"]})
                         else:
-                            moves_detail.append({"candidate_mode": "policy_only"})
+                            moves_detail.append({"hard_mode": "policy_only"})
                     else:
                         action = rapfi.analyze(game, 1).moves[0].action
                     game.move(action)
@@ -480,6 +571,7 @@ def evaluate_rapfi(model, cfg, device, engine, engine_dir, pairs,
                 results.append({"result": game.winner * color, "color": color,
                                 "winner": game.winner, "pair": pair,
                                 "moves": list(game.history), "moves_detail": moves_detail})
-                print(f"evaluation opponent=rapfi search={search} candidates={candidates} "
+                print(f"evaluation opponent=rapfi search={search} "
+                      f"hard_rules={options['hard_rules']} bias={options['bias']} "
                       f"games={len(results)}/{pairs * 2}", flush=True)
     return finish()

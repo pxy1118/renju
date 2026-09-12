@@ -41,11 +41,12 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from vk.candidates import candidate_mask, forced_candidates  # noqa: E402
+from vk.candidates import forced_candidates, hard_candidates   # noqa: E402
 from vk.datasets import load_split, topk_valid               # noqa: E402
 from vk.evaluation import bootstrap_interval                 # noqa: E402
 from vk.game import Game                                     # noqa: E402
 from vk.network import Evaluator, Network, architecture_of   # noqa: E402
+from vk.storage import load_model_state                        # noqa: E402
 from vk.rapfi import RapfiClient                             # noqa: E402
 
 BUCKETS = ((0.01, "equivalent"), (0.02, "minor"), (0.05, "moderate"),
@@ -136,12 +137,10 @@ def engine_moves(client, game, multipv, cache, rule, commit=False):
     return cached
 
 
-def model_move(game, evaluator, candidates):
-    """The model's action under one candidate mode, with no search involved."""
-    restricted = forced_candidates(game) if candidates in ("forced", "tactical") \
-        else candidate_mask(game, candidates)
-    logits, _ = evaluator(game.encode())
-    logits = np.asarray(logits, dtype=np.float64)
+def model_move(game, evaluator, hard_rules="forced"):
+    """The model's action under one hard-rule mode, with no search involved."""
+    restricted = hard_candidates(game, hard_rules)
+    logits = np.asarray(evaluator(game.encode()).policy, dtype=np.float64)
     if logits.shape != (225,) or not np.isfinite(logits).all():
         raise RuntimeError("Invalid network policy output")
     allowed = restricted.mask.copy()
@@ -244,10 +243,9 @@ def main():
     parser.add_argument("--limit", type=int, default=1500)
     parser.add_argument("--stride", type=int, default=1,
                         help="take every Nth record before applying --limit")
-    parser.add_argument("--candidates", default="forced",
-                        choices=["tactical", "forced", "legal"],
-                        help="forced/tactical both use the deterministic rule set; "
-                             "legal lets every point compete")
+    parser.add_argument("--hard-rules", default="forced", choices=["forced", "none"],
+                        help="forced keeps only complete-a-five and block-a-five; "
+                             "none lets every legal point compete")
     parser.add_argument("--max-nodes", type=int, default=200_000)
     parser.add_argument("--parent-multipv", type=int, default=5,
                         help="parent MultiPV; 5 gives the top1-top2 gap decision_critical needs")
@@ -267,7 +265,9 @@ def main():
     for label, path in (("a", args.checkpoint), ("b", args.compare_checkpoint)):
         if path is None:
             continue
-        state = torch.load(path, map_location=args.device, weights_only=False)
+        # load_model_state upgrades a pre-refactor checkpoint, whose state
+        # dict predates the horizon value heads.
+        state = load_model_state(path, args.rule)
         model = Network(architecture_of(state["config"])).to(args.device)
         model.load_state_dict(state["model"])
         model.eval()
@@ -308,14 +308,15 @@ def main():
                                              args.rule).items(), key=lambda item: -item[1])
                 p_best = float(ranked[0][1])
                 engine_best = int(ranked[0][0])
-                recorded_best = int(data["teacher_best"][index]) if "teacher_best" in data else None
+                fields = data.dtype.names or ()
+                recorded_best = int(data["teacher_best"][index]) if "teacher_best" in fields else None
                 if recorded_best is not None and recorded_best != engine_best:
                     disagreements += 1
                     present += int(any(action == recorded_best for action, _ in ranked))
-                forced = forced_candidates(game).mask
+                forced = hard_candidates(game, args.hard_rules).mask
                 for label, evaluator in loaded.items():
-                    allowed = game.legal() if args.candidates == "legal" else forced
-                    logits, _ = evaluator(game.encode())
+                    allowed = forced
+                    logits = evaluator(game.encode()).policy
                     choice = int(np.argmax(np.where(allowed, logits, -np.inf)))
                     in_top5 = any(action == choice for action, _ in ranked)
                     if in_top5:
@@ -371,7 +372,7 @@ def main():
     excluded = [row for row in rows["a"] if row is not None]
     report = {        "dataset": str(Path(args.dataset).resolve()), "split": args.split,
         "rows_requested": len(order), "rows_skipped": failures, "stride": args.stride,
-        "candidates": args.candidates,
+        "hard_rules": args.hard_rules,
         "scale": ("regret is in raw winrate probability points: "
                   "regret = p_best - p_model = p_best + p_child - 1"),
         "caveat": ("p_i come from one Rapfi root search; comparing moves across "

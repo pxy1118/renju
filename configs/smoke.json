@@ -3,6 +3,8 @@
   "channels": 8,
   "blocks": 1,
   "simulations": 4,
+  "cheap_search_prob": 0.75,
+  "cheap_search_simulations": 2,
   "workers": 2,
   "games_per_round": 2,
   "train_steps": 2,

@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>棋间 · 观战</title><link rel="stylesheet" href="/style.css"></head>
+<body>
+<header><a class="brand" href="/">棋间<span>VISK</span></a><div class="badge"><i></i><span id="badge">观战席 · 只读</span></div></header>
+<main>
+<section class="intro"><div class="eyebrow">SPECTATE</div><h1>观棋不语。</h1><p>这里镜像服务上所有正在进行的对局；想亲手落子，请向服务提供者要邀请链接。</p></section>
+<div class="layout">
+<section class="play-area" aria-label="观战棋盘">
+<div class="board-top"><div><span id="turn-dot" class="stone-icon black"></span><strong id="status" role="status" aria-live="polite">等待对局开始</strong></div><span id="count">第 0 手</span></div>
+<div class="board-frame"><div id="board" role="group" aria-label="十五路棋盘 · 观战"></div></div>
+<div class="board-bottom"><span id="hint">对局自动刷新；观战是只读的。</span><label><input type="checkbox" id="numbers" checked> 显示手数</label></div>
+</section>
+<aside>
+<section class="panel"><div class="panel-title"><h2>正在进行的对局</h2><span id="table-count">0 局</span></div>
+<label class="field">选择对局<select id="table"><option value="">还没有对局</option></select></label>
+<div id="model-name">尚未载入</div><div id="model-detail" class="muted">对局开始后显示检查点信息</div>
+<div class="model-stats"><div><small>推理设备</small><strong>CPU <em>独立进程</em></strong></div><div><small>本局手数</small><strong id="elapsed">—</strong></div></div>
+</section>
+<section class="panel history-panel"><div class="panel-title"><h2>落子记录</h2><span id="history-count">0 MOVES</span></div><div id="history"><p class="muted">棋盘静候第一手。</p></div></section>
+</aside></div>
+<div id="error" role="alert" hidden></div>
+<footer><span>VISK / HUMAN × MACHINE</span><span>十五路棋盘 · 自我对弈学习</span></footer>
+</main><script src="/board.js"></script><script src="/watch.js"></script></body></html>

@@ -1,8 +1,22 @@
-"""Shared tactical move candidates used by every local MCTS caller."""
+"""Tactical move handling shared by every local MCTS caller.
+
+Two mechanisms, deliberately separated:
+
+*  A *hard* rule only covers cases where the move is determined: complete a
+   five, or block the opponent five. Those may exclude legal points, because
+   there is nothing to choose.
+*  A *soft* bias covers everything empirical: a forcing four, a neighbourhood
+   around the stones, the centre opening. Those add to the prior and never
+   remove a legal point from consideration, so a heuristic that is wrong costs
+   prior mass instead of making the right move unreachable.
+"""
 from dataclasses import dataclass
 import numpy as np
 
 from .game import DIRECTIONS, SIZE, lengths, forbidden
+
+HARD_RULES = ("forced", "none")
+SEARCH_BIAS = ("none", "tactical")
 
 
 @dataclass(frozen=True)
@@ -21,7 +35,7 @@ def _legal_for_color(game, color):
 
 
 def immediate_wins(game, color=None):
-    """Return legal placements that immediately win for ``color``."""
+    """Return legal placements that immediately win for color."""
     color = game.player if color is None else int(color)
     legal = game.legal() if color == game.player else _legal_for_color(game, color)
     wins = np.zeros(SIZE * SIZE, dtype=bool)
@@ -36,12 +50,12 @@ def immediate_wins(game, color=None):
 
 
 def four_threats(game, color=None):
-    """Legal placements after which ``color`` has a forced four.
+    """Legal placements after which color has a forced four.
 
     A forced four is four in a row with both outer ends still empty, so the
-    opponent's single stone cannot cover both ways to five. An immediate-five
+    opponent single stone cannot cover both ways to five. An immediate-five
     test cannot see this -- the move creates a four, not a five -- which is why
-    a straight three can be lethal while ``immediate_wins`` reports nothing.
+    a straight three can be lethal while immediate_wins reports nothing.
 
     A run is only forced when it is exactly four long with both ends empty: a
     four against the board edge, or one whose far end is blocked, is a sleeping
@@ -78,7 +92,7 @@ def four_threats(game, color=None):
 
 
 def tacticals(game):
-    """Legal placements that block every one of the opponent's immediate wins.
+    """Legal placements that block every one of the opponent immediate wins.
 
     Usually a single point; two or more only when the opponent has a double
     four, in which case the position is already lost and the set is what is
@@ -89,18 +103,15 @@ def tacticals(game):
 
 
 def legal_candidates(game):
-    """Every legal placement; no tactical pruning at all."""
+    """Every legal placement; no tactical treatment at all."""
     return CandidateSet(game.legal(), "all_legal")
 
 
 def forced_candidates(game):
-    """Only the moves whose value is *determined*, with no heuristic pruning.
+    """Only the moves whose value is determined, with no heuristic pruning.
 
-    Three cases: complete a five, block the opponent's five, or nothing is
-    determined and every legal point is offered. ``four_threats`` is
-    deliberately absent -- a forcing four is strong, not forced, and letting it
-    choose the action set is exactly what excluded 5.43% of Rapfi's best moves
-    and made a whole class of positions unwinnable.
+    Three cases: complete a five, block the opponent five, or nothing is
+    determined and every legal point is offered.
     """
     own = immediate_wins(game)
     if own.any():
@@ -111,61 +122,49 @@ def forced_candidates(game):
     return legal_candidates(game)
 
 
-def candidate_mask(game, mode="tactical"):
-    """Candidate set for one search mode.
+def hard_candidates(game, mode="forced"):
+    """The legal set search may actually consider.
 
-    ``tactical`` keeps the historical ``square3_line4`` pruning, ``forced``
-    keeps only the deterministic rules, ``legal`` keeps everything.
+    forced: the deterministic cases above, every legal point otherwise.
+    none:   every legal point, always.
     """
-    if mode == "tactical":
-        return tactical_candidates(game)
     if mode == "forced":
         return forced_candidates(game)
-    if mode == "legal":
+    if mode == "none":
         return legal_candidates(game)
-    raise ValueError(f"Unknown candidate mode: {mode!r} "
-                     f"(known: ['tactical', 'forced', 'legal'])")
+    raise ValueError(f"Unknown hard rule mode: {mode!r} (known: {list(HARD_RULES)})")
 
 
-def tactical_candidates(game):
-    """Rapfi-inspired, symmetry-equivariant candidate set for one node."""
+def tactical_bias(game, four=2.0, neighbour=0.5, radius=3):
+    """Additive logit bias for empirical tactical shape, never an exclusion.
+
+    The bias is what the old candidate mask was trying to express: forcing fours
+    and the neighbourhood of the stones deserve more prior mass, but a legal
+    point that the heuristic does not like must still be reachable -- that is
+    how a heuristic mistake stays recoverable.
+    """
+    bias = np.zeros(SIZE * SIZE, dtype=np.float64)
     legal = game.legal()
-    own = immediate_wins(game)
-    if own.any():
-        return CandidateSet(own & legal, "forced_win")
-
-    # Defence outranks our own four. A forcing four does not stop an immediate
-    # five: the opponent simply blocks and then wins, so offering our four here
-    # would let search pick a move that loses on the spot.
-    defences = tacticals(game)
-    if defences.any():
-        return CandidateSet(defences, "forced_defense")
-
-    # Now a four of our own is safe to play: the opponent must answer it, so it
-    # costs nothing and may win outright.
-    forcing = four_threats(game)
-    if forcing.any():
-        return CandidateSet(forcing, "strategic")
-
     occupied = np.flatnonzero(game.board)
     if not len(occupied):
-        mask = np.zeros(SIZE * SIZE, dtype=bool)
-        mask[(SIZE * SIZE) // 2] = True
-        return CandidateSet(mask & legal, "empty_center")
-
-    mask = np.zeros((SIZE, SIZE), dtype=bool)
-    for point in occupied:
-        r, c = divmod(int(point), SIZE)
-        mask[max(0, r - 3):min(SIZE, r + 4), max(0, c - 3):min(SIZE, c + 4)] = True
-        for dr, dc in DIRECTIONS:
-            for distance in range(-4, 5):
-                rr, cc = r + distance * dr, c + distance * dc
-                if 0 <= rr < SIZE and 0 <= cc < SIZE:
-                    mask[rr, cc] = True
-    result = mask.reshape(-1) & legal
-    if not result.any():
-        result = legal.copy()
-        mode = "fallback_all"
-    else:
-        mode = "square3_line4"
-    return CandidateSet(result, mode)
+        # An empty board has no neighbourhood to bias; the centre keeps the
+        # prior mass the old candidate set gave it, without excluding anything.
+        bias[SIZE * SIZE // 2] += float(four)
+        return bias
+    if four > 0:
+        threats = four_threats(game)
+        if threats.any():
+            bias[threats] += float(four)
+    if neighbour > 0:
+        window = np.zeros((SIZE, SIZE), bool)
+        for point in occupied:
+            r, c = divmod(int(point), SIZE)
+            window[max(0, r - radius):min(SIZE, r + radius + 1),
+                   max(0, c - radius):min(SIZE, c + radius + 1)] = True
+            for dr, dc in DIRECTIONS:
+                for distance in range(-4, 5):
+                    rr, cc = r + distance * dr, c + distance * dc
+                    if 0 <= rr < SIZE and 0 <= cc < SIZE:
+                        window[rr, cc] = True
+        bias[window.reshape(-1)] += float(neighbour)
+    return bias * legal

@@ -12,7 +12,7 @@ import torch
 
 from vk.evaluation import evaluate_rapfi, match, summary, paired_delta
 from vk.network import Network
-from vk.training import DEFAULTS
+from vk.config import DEFAULTS
 
 
 def fake_engine(path, winrate=0.5):
@@ -59,12 +59,14 @@ def cfg(**overrides):
 def test_evaluate_rapfi_reports_the_arm_it_ran(tmp_path):
     engine = fake_engine(tmp_path / "engine.py")
     model = Network("hybrid-8-1")
-    report = evaluate_rapfi(model, cfg(search="policy", candidates="legal"), "cpu",
+    report = evaluate_rapfi(model, cfg(search="policy", hard_rules="none",
+                                       search_bias="none"), "cpu",
                             engine, tmp_path, pairs=1, threads=1, hash_mb=8,
                             max_nodes=10, timeout=2)
     assert report["games"] == 2 and report["complete"]
     assert set(report["by_color"]) == {"1", "-1"}
-    assert report["search_mode"] == "policy" and report["candidates"] == "legal"
+    assert report["search_mode"] == "policy" and report["hard_rules"] == "none"
+    assert report["search_bias"] == "none"
     assert report["simulations"] == 0 and report["max_nodes"] == 10
     assert report["opening_mode"] == "sampled" and report["opening_seed"] == 91823
 
@@ -72,11 +74,11 @@ def test_evaluate_rapfi_reports_the_arm_it_ran(tmp_path):
 def test_policy_search_records_moves_without_search_statistics(tmp_path):
     engine = fake_engine(tmp_path / "engine.py")
     model = Network("hybrid-8-1")
-    report = evaluate_rapfi(model, cfg(search="policy", candidates="forced"), "cpu",
+    report = evaluate_rapfi(model, cfg(search="policy", hard_rules="forced"), "cpu",
                             engine, tmp_path, pairs=1, threads=1, hash_mb=8,
                             max_nodes=10, timeout=2)
     statistics = report["search_statistics"]
-    assert statistics["candidate_mode_hist"] == {"policy_only": statistics["moves"]}
+    assert statistics["hard_mode_hist"] == {"policy_only": statistics["moves"]}
     # A policy arm has no MCTS measurements to publish, and must not pretend
     # they were taken and came out empty.
     assert "search_prior_kl_mean" not in statistics
@@ -86,12 +88,13 @@ def test_policy_search_records_moves_without_search_statistics(tmp_path):
 def test_mcts_search_records_root_visit_shape(tmp_path):
     engine = fake_engine(tmp_path / "engine.py")
     model = Network("hybrid-8-1")
-    report = evaluate_rapfi(model, cfg(search="mcts", candidates="legal", simulations=3),
+    report = evaluate_rapfi(model, cfg(search="mcts", hard_rules="forced",
+                                       search_bias="tactical", simulations=3),
                             "cpu", engine, tmp_path, pairs=1, threads=1, hash_mb=8,
                             max_nodes=10, timeout=2)
     assert report["search_mode"] == "mcts" and report["simulations"] == 3
     statistics = report["search_statistics"]
-    assert "all_legal" in statistics["candidate_mode_hist"]
+    assert set(statistics["hard_mode_hist"]) <= {"all_legal", "forced_win", "forced_defense"}
     assert statistics["root_visited_moves_mean"] is not None
     assert 0 <= statistics["root_max_visit_share_mean"] <= 1
 

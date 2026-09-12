@@ -3,16 +3,16 @@
 Each arm differs from another by exactly one switch, so a paired bootstrap
 interval between two arms answers one question and nothing else:
 
-    A1 vs A2   does the forced-tactic rule (complete a five / block a five) help?
-    A2 vs A4   does MCTS + value help at all?   <- the only isolation of search
-    A3 vs A4   what does the square3_line4 candidate pruning cost?
-    A1 vs A3   engineering comparison only: two variables differ, so it explains nothing.
+    A1 vs A2   do the hard tactical rules (complete a five / block a five) help?
+    A2 vs A3   does adding the soft tactical bias to the prior help?
+    A3 vs A4   does MCTS + value help at all?   <- the only isolation of search
+    A4 vs A5   does a larger search budget help?
 
-``A1`` uses ``forced`` candidates and ``A3`` the historical ``tactical`` set
-precisely so those two comparisons stay clean. Plain ``policy`` compared against
-plain ``mcts`` at the same candidate mode would be the same test as A2 vs A4.
+A1 is the raw policy prior, A3 the policy prior plus bias, A4 the full search:
+that chain isolates one switch per step. Plain policy against plain MCTS at the
+same settings would be the same test as A3 vs A4.
 
-Run a small pass first (``--pairs 25``) to see the direction, then widen.
+Run a small pass first (--pairs 25) to see the direction, then widen.
 """
 import argparse
 from pathlib import Path
@@ -24,7 +24,22 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from vk.evaluation import evaluate_rapfi, paired_delta              # noqa: E402
 from vk.network import Network, architecture_of                     # noqa: E402
-from vk.training import DEFAULTS                                    # noqa: E402
+from vk.config import DEFAULTS                                      # noqa: E402
+from vk.storage import load_model_state                             # noqa: E402
+
+ARMS = {
+    "A1-policy-nohard": {"search": "policy", "hard_rules": "none", "search_bias": "none"},
+    "A2-policy-hard": {"search": "policy", "hard_rules": "forced", "search_bias": "none"},
+    "A3-policy-bias": {"search": "policy", "hard_rules": "forced", "search_bias": "tactical"},
+    "A4-mcts": {"search": "mcts", "hard_rules": "forced", "search_bias": "tactical"},
+}
+A5 = {"A5-mcts-wide": {"search": "mcts", "hard_rules": "forced", "search_bias": "tactical",
+                       "simulations": 1600}}
+QUESTIONS = (("A1-policy-nohard", "A2-policy-hard", "hard tactical rules"),
+             ("A2-policy-hard", "A3-policy-bias", "soft tactical bias"),
+             ("A3-policy-bias", "A4-mcts", "MCTS + value"),
+             ("A4-mcts", "A5-mcts-wide", "more simulations"))
+
 
 ARMS = {
     "A1-policy-forced": {"search": "policy", "candidates": "forced"},
@@ -46,7 +61,8 @@ def summary_line(name, report):
             "wilson_ci95": report["score_wilson_ci95"],
             "by_color": report["by_color"], "games": report["games"],
             "complete": report["complete"],
-            "search_mode": report["search_mode"], "candidates": report["candidates"],
+            "search_mode": report["search_mode"],
+            "hard_rules": report["hard_rules"], "search_bias": report["search_bias"],
             "simulations": report["simulations"],
             "search_statistics": statistics}
 
@@ -61,7 +77,7 @@ def main():
     parser.add_argument("--pairs", type=int, default=25)
     parser.add_argument("--arms", nargs="+", default=list(ARMS), choices=list(ARMS) + list(A5))
     parser.add_argument("--with-a5", action="store_true",
-                        help="also run the 1600-simulation arm (only worth it if A4 beat A2)")
+                        help="also run the 1600-simulation arm (only worth it if A4 beat A3)")
     parser.add_argument("--minutes", type=float, default=240)
     parser.add_argument("--max-nodes", type=int, default=200_000)
     parser.add_argument("--engine-threads", type=int, default=4)
@@ -71,7 +87,7 @@ def main():
     args = parser.parse_args()
 
     import torch
-    state = torch.load(args.checkpoint, map_location=args.device, weights_only=False)
+    state = load_model_state(args.checkpoint, "freestyle")
     cfg = dict(DEFAULTS, rule="freestyle", simulations=400)
     cfg.update({key: value for key, value in state["config"].items() if key in DEFAULTS})
     model = Network(architecture_of(state["config"])).to(args.device)
@@ -82,11 +98,12 @@ def main():
     output.mkdir(parents=True, exist_ok=True)
     catalog = {name: options for name, options in {**ARMS, **A5}.items()}
     reports, started = {}, time.monotonic()
-    for name in args.arms + (["A5-mcts-legal-1600"] if args.with_a5 and
-                             "A5-mcts-legal-1600" not in args.arms else []):
+    for name in args.arms + (["A5-mcts-wide"] if args.with_a5 and
+                             "A5-mcts-wide" not in args.arms else []):
         arm = dict(cfg, **catalog[name])
-        print(f"=== {name}: search={arm['search']} candidates={arm['candidates']} "
-              f"simulations={arm['simulations']} pairs={args.pairs} ===", flush=True)
+        print(f"=== {name}: search={arm['search']} hard_rules={arm['hard_rules']} "
+              f"bias={arm['search_bias']} simulations={arm['simulations']} "
+              f"pairs={args.pairs} ===", flush=True)
         report = evaluate_rapfi(model, arm, args.device, args.engine, args.engine_dir,
                                 args.pairs, time.monotonic() + args.minutes * 60,
                                 lambda: False, args.engine_threads, args.engine_hash_mb,

@@ -28,35 +28,42 @@ python main.py evaluate --rule freestyle --checkpoint latest --output runs/frees
 
 教师默认运行 4 个进程，每进程 4 线程、256 MB Hash、200,000 节点，读取最后一个完整的 Top-5 深度；单次 5 秒超时，进程最多重启两次。YXBOARD 按当前行棋方编码（`1=当前方`、`2=对手`）。残缺输出、重复/非法落点和持续失败会显式报错，不产生替代标签。数据按整局分到 80/10/10，再仅对训练批次做 D4 增强；NPZ 不允许 pickle，每片最多 4096 条，`manifest.json` 记录生成参数及可执行文件、配置和权重哈希。`data/teacher/` 已被 Git 忽略。
 
-### 数据格式 3：逐着法胜率与真实代价
+### 数据格式 4：一个局面就是一条显式记录
 
-格式 2 的 `policy[i]` 是 Rapfi 胜率的 odds 变换再做 softmax 归一化（并与本地候选集 98/2 混合）的结果，它是一组**着法分配质量**，不是胜率。把两个位置上的 `policy` 相减得到的并不是胜率差，历史记录里的“23% 真错率”正是这样被误读的。
-
-格式 3 在原有七个字段之外增加：
+`vk/records.py` 是唯一真源：一条 self-play / 教师记录是一组**具名字段**，不是 `(x, pi, z)` 这样的元组。生产（`vk/selfplay.py`、`vk/teacher.py`）、存储（`vk/datasets.py`）、回放（`vk/replay.py`）与损失（`vk/objective.py`）都按同一张表读写。
 
 | 字段 | dtype | 含义 |
 |---|---|---|
-| `teacher_topk_actions` | `uint8 (N,5)` | Rapfi MultiPV 分析到的着法，按胜率降序；不足 5 个填 `255` |
-| `teacher_topk_winrates` | `float16 (N,5)` | 上述着法的**原始胜率**（侧行棋方视角），不做任何变换 |
+| `state` / `policy` | `uint8(3,15,15)` / `float16(225,)` | 棋盘平面 / 剪枝去噪后的搜索目标 |
+| `policy_valid` / `policy_weight` | `uint8` / `float16` | 该行是否监督策略头；PCR 的 cheap 着法权重为 0 |
+| `value` / `value_valid` | `float16(3,)` / `uint8` | 三个 value head 的目标（float 无效位为 NaN），位掩码说明哪几个有效 |
+| `search_value` / `q_spread` | `float16` | 本局面的根 Q；根节点被访问子节点 Q 的 max−min |
+| `policy_surprise` / `value_surprise` | `float16` | KL(目标‖先验)；\|Q − V_net\| |
+| `weight` / `simulations` / `full_search` | `float32` / `uint32` / `uint8` | Surprise 采样权重；本着预算；是否深搜 |
+| `game_id` / `ply` / `winner` / `source` | `uint32` / `uint16` / `int8` / `uint8` | 对局与手数、绝对胜负、来源（self-play / 教师 / 旧文件归一化） |
+| teacher 附加组 | `teacher_best`、`teacher_nodes`、`teacher_topk_actions`、`teacher_topk_winrates` | 引擎分析，self-play 行写哨兵 |
 
-格式 2 的旧数据仍然可读：合并或读取时这些行写成哨兵（`actions == 255`、`winrates == NaN`），用 `vk.datasets.topk_valid()` 判断某行是否有真实胜率，不需要额外的旁路文件。`vk.datasets.combine_datasets()` 可把 v2 与 v3 数据集合并为一个，重编号时会同时改写高位，因此同一局的所有位置始终落在同一个 split。
+三个 value head 是 **final / mid / short**：`final` 读终局结果，`mid`/`short` 在 10 / 4 手的地平线上截断，未终局时用该局面自己的 `search_value` 做 bootstrap（奇数手符号翻转）。这就是「多时间尺度」：终局标签在小棋盘上必然饱和（`|v|>0.9` 一度占 97%），而地平线标签不是。
+
+旧数据不需要重新生成：`vk/records.normalize_legacy()` 在**读取时**把 v2/v3 的 `value` 映射成 final head 与 `search_value`，地平线 head 标为无效、`source=2`（这些文件从未记录过局面结果）。`vk.datasets.combine_datasets()` 可把 v2/v3/v4 混着合并，重编号时同时改写高位，因此同一局的所有位置始终落在同一个 split。
 
 `artifacts/diag_teacher_regret.py` 用这个尺度测量模型的实际代价：
 
 ```powershell
-python artifacts/diag_teacher_regret.py --dataset data/teacher/freestyle-v2 --checkpoint runs/freestyle-pretrain/best.pt --engine external/rapfi-runtime/pbrain-rapfi.exe --engine-dir external/rapfi-runtime --split test --limit 1500 --candidates tactical
+python artifacts/diag_teacher_regret.py --dataset data/teacher/freestyle-v2 --checkpoint runs/freestyle-pretrain/best.pt --engine external/rapfi-runtime/pbrain-rapfi.exe --engine-dir external/rapfi-runtime --split test --limit 1500 --hard-rules forced
 ```
 
 对每个局面它取**一次** Rapfi Top-5 根搜索作为参照：若模型着法在 Top-5 内，`regret = p_top1 - p_模型`（同一次搜索，无需额外查询）；否则再分析模型着法之后的子局面，用 `regret = p_top1 + p_child - 1`。所有数字都是**原始胜率百分点**（`0.05` 就是损失 5 个百分点），报告分桶、分 ply 段、以及“top1 与 top2 差距 > 0.05”的决策关键子集，并输出逐行 CSV。Rapfi 的作答按 `(局面, 引擎, 节点预算)` 缓存，可中断续跑。
 
 ### 解耦 policy / value / MCTS / 候选集
 
-`--search`、`--candidate-mode`、`--opening-mode` 三个开关互相独立，用来判断每个部件的真实贡献（命令行的显式参数优先于配置文件和 checkpoint 内保存的配置）：
+`--search`、`--hard-rules`、`--search-bias`、`--opening-mode` 四个开关互相独立，用来判断每个部件的真实贡献（命令行的显式参数优先于配置文件和 checkpoint 内保存的配置）：
 
 | 开关 | 取值 | 含义 |
 |---|---|---|
 | `--search` | `mcts` / `policy` | MCTS+价值，或直接取策略 argmax（不搜索、不用价值头） |
-| `--candidate-mode` | `tactical` / `forced` / `legal` | 历史 `square3_line4` 硬裁剪 / 只保留成五与必挡 / 全部合法点 |
+| `--hard-rules` | `forced` / `none` | 只保留**确定性**战术（成五、必挡），或完全不做硬约束 |
+| `--search-bias` | `tactical` / `none` | 对成四威胁与棋子邻域加先验偏置；**永不排除任何合法着法** |
 | `--opening-mode` | `sampled` / `teacher` / `book` / `none` | 统一随机平衡开局 / 教师式开局（随机首手后按 Rapfi Top-5 采样） / 均势开局库 / 空盘 |
 
 ### 均势开局库（`--opening-mode book`）
@@ -77,23 +84,25 @@ python main.py evaluate --rule freestyle --checkpoint best --output runs/policy-
 四种组合的对照（同一 checkpoint、同一 200k 节点 Rapfi、同一开局种子，`--pairs` 是**开局对数**，实际对局数为其两倍）：
 
 ```powershell
-# A1 policy+forced   A2 policy+legal   A3 mcts+tactical   A4 mcts+legal
-python main.py evaluate --rule freestyle --checkpoint best --output runs/freestyle-pretrain --opponent rapfi --engine external/rapfi-runtime/pbrain-rapfi.exe --engine-dir external/rapfi-runtime --pairs 25 --minutes 120 --search policy --candidate-mode forced
-python main.py evaluate --rule freestyle --checkpoint best --output runs/freestyle-pretrain --opponent rapfi --engine external/rapfi-runtime/pbrain-rapfi.exe --engine-dir external/rapfi-runtime --pairs 25 --minutes 120 --search policy --candidate-mode legal
-python main.py evaluate --rule freestyle --checkpoint best --output runs/freestyle-pretrain --opponent rapfi --engine external/rapfi-runtime/pbrain-rapfi.exe --engine-dir external/rapfi-runtime --pairs 25 --minutes 120 --candidate-mode tactical
-python main.py evaluate --rule freestyle --checkpoint best --output runs/freestyle-pretrain --opponent rapfi --engine external/rapfi-runtime/pbrain-rapfi.exe --engine-dir external/rapfi-runtime --pairs 25 --minutes 120 --candidate-mode legal
+# A1 policy+nohard   A2 policy+hard   A3 policy+hard+bias   A4 mcts+hard+bias
+python main.py evaluate --rule freestyle --checkpoint best --output runs/freestyle-pretrain --opponent rapfi --engine external/rapfi-runtime/pbrain-rapfi.exe --engine-dir external/rapfi-runtime --pairs 25 --minutes 120 --search policy --hard-rules none --search-bias none
+python main.py evaluate --rule freestyle --checkpoint best --output runs/freestyle-pretrain --opponent rapfi --engine external/rapfi-runtime/pbrain-rapfi.exe --engine-dir external/rapfi-runtime --pairs 25 --minutes 120 --search policy --hard-rules forced --search-bias none
+python main.py evaluate --rule freestyle --checkpoint best --output runs/freestyle-pretrain --opponent rapfi --engine external/rapfi-runtime/pbrain-rapfi.exe --engine-dir external/rapfi-runtime --pairs 25 --minutes 120 --search policy --hard-rules forced --search-bias tactical
+python main.py evaluate --rule freestyle --checkpoint best --output runs/freestyle-pretrain --opponent rapfi --engine external/rapfi-runtime/pbrain-rapfi.exe --engine-dir external/rapfi-runtime --pairs 25 --minutes 120 --search mcts --hard-rules forced --search-bias tactical
+# search-vs-policy：同一个 checkpoint 自己对自己，一侧搜索、一侧纯策略
+python main.py evaluate --rule freestyle --checkpoint best --output runs/freestyle-pretrain --opponent self-policy --pairs 25 --minutes 120
 ```
 
-每个报告都带 `search_mode`/`candidates`/`opening_mode`/`opening_seed`，以及搜索形状诊断：`root_visited_moves`、`root_max_visit_share`、`root_visit_entropy`。它们才是“搜索有没有展开”的证据——`节点访问数 / 模拟次数` 恒等于 1，没有信息量。跨臂比较用 `vk.evaluation.paired_delta()` 在同一开局上做成对 bootstrap 区间，而不是并排看两个 Wilson 区间。
+每个报告都带 `search_mode`/`hard_rules`/`search_bias`/`opening_mode`/`opening_seed`，以及搜索形状诊断：`root_visited_moves`、`root_max_visit_share`、`root_visit_entropy`、`q_spread`（兄弟 Q 扩散）、`kl_target_prior`（搜索比先验多出的信息）。`--opponent self-policy` 给出 `search_advantage_pp` 与其配对区间：区间覆盖 0 就是「搜索没有带来可测增益」。它们才是“搜索有没有展开”的证据——`节点访问数 / 模拟次数` 恒等于 1，没有信息量。跨臂比较用 `vk.evaluation.paired_delta()` 在同一开局上做成对 bootstrap 区间，而不是并排看两个 Wilson 区间。
 
 模型先手、Rapfi 标注的 DAgger 式数据：
 
 ```powershell
-python artifacts/dagger_collect.py --checkpoint runs/freestyle-pretrain/best.pt --engine external/rapfi-runtime/pbrain-rapfi.exe --engine-dir external/rapfi-runtime --output data/teacher/dagger-v1 --positions 2000 --candidates legal --search policy
+python artifacts/dagger_collect.py --checkpoint runs/freestyle-pretrain/best.pt --engine external/rapfi-runtime/pbrain-rapfi.exe --engine-dir external/rapfi-runtime --output data/teacher/dagger-v1 --positions 2000 --hard-rules none --search-bias none --search policy
 python main.py pretrain --rule freestyle --dataset data/teacher/freestyle-v2 --mix-dataset data/teacher/dagger-v1 --mix-share 0.5 --output runs/freestyle-pretrain-v3 --steps 20000
 ```
 
-DAgger 输出仍是标准格式 3；每条决策的 `regret` 与 `hard` 只写在 `diagnostics.csv` 里，不进训练 schema。`pretrain --value-weight 0` 训练纯策略模型：此时 loss、best checkpoint 的选择分数、以及战术闸门都会同步切换（闸门改为策略 argmax + 强制着法），`value_mae` 不再作为验收项。
+DAgger 输出仍是标准 position schema；每条决策的 `regret` 与 `hard` 只写在 `diagnostics.csv` 里，不进训练 schema。`pretrain --value-weight 0` 训练纯策略模型：此时 loss、best checkpoint 的选择分数、以及战术闸门都会同步切换（闸门改为策略 argmax + 强制着法），`value_mae` 不再作为验收项。
 
 `scripts/compare_arms.py` 一次跑完 A1–A4 并直接给出成对区间（`--pairs` 是开局对数）：
 
@@ -159,7 +168,7 @@ Web UI 固定使用 **CPU、单推理线程**，不申请 CUDA 或训练 GPU 锁
 
 ### 临时分享给朋友（默认最多 10 桌）
 
-默认不开分享；加上 `--share` 与 `--host <局域网IP>` 后，服务会打印一条**邀请链接**，朋友在同一局域网打开即可入局。临时分享可以直接双击 `share-webui.bat`（等价于 `start-webui.ps1 -Share`，自动选默认路由的局域网地址），或手写命令：
+默认不开分享；加上 `--share` 与 `--host <局域网IP>` 后，服务会打印两条链接：**邀请链接**让朋友入局对弈，**观战链接**让人只读观战。临时分享可以直接双击 `share-webui.bat`（等价于 `start-webui.ps1 -Share`，自动选默认路由的局域网地址），或手写命令：
 
 ```powershell
 # 查本机局域网地址，然后把它填进 --host
@@ -176,11 +185,13 @@ Get-NetIPAddress -AddressFamily IPv4 | Where-Object AddressState -eq Preferred
 ```text
 Visk Web UI: http://127.0.0.1:8765 (CPU inference; training continues)
 分享链接（最多 10 桌）: http://192.168.1.3:8765/?k=<随机串>
+观战链接（只读，不占棋桌）: http://192.168.1.3:8765/watch?w=<随机串>
 ```
 
 分享的语义与边界：
 
-- **每人一张独立棋桌**。打开邀请链接的浏览器会拿到一个会话 Cookie，之后自己的棋局互不干扰；页面右侧出现“邀请棋友”面板，显示当前桌数与可复制的链接。
+- **每人一张独立棋桌**。打开邀请链接的浏览器会拿到一个会话 Cookie，之后自己的棋局互不干扰；页面右侧出现“邀请与观战”面板，显示当前桌数与可复制的链接。
+- **观战链接是只读的**。打开 `/watch?w=…` 的人进入一个观战页：镜像服务上所有正在进行的对局（选桌、棋盘、落子记录每秒刷新），但观战者不占用棋桌名额、看不到 CSRF 令牌，所有落子路由对它一律拒绝——观战在结构上就落不了子。观战串与邀请串是两把独立的钥匙，互不通用。
 - **链接只在地址栏停留一次**。服务把 `?k=` 换成 Cookie 后重定向到干净的 `/`，所以刷新、后退都不会再把凭据带在地址里；`Set-Cookie` 带 `HttpOnly` 与 `SameSite=Strict`。
 - **默认最多 10 桌**（`--max-sessions`，1–16）。名额是资源上限而不是队列：每张棋桌各自持有一份网络与搜索树，所以第 11 个人会看到“名额已满”的 429 页面，而不是把别人的棋局挤掉。下完点“结束我的棋桌”就会释放名额。内存不是瓶颈：实测每桌约 16–30 MB（网络权重只有约 2 MB，占大头的是搜索树），10 桌加起来也就几百 MB；**先撑不住的是 CPU**——每个棋桌各自搜索，同时思考的人越多，每人等待越久。
 - **临时性**。邀请串和所有棋桌都只在内存里，服务一停全部失效；`Ctrl+C` 后朋友那边只会在下一次轮询失败，页面提示连接失败。
@@ -200,16 +211,18 @@ Visk Web UI: http://127.0.0.1:8765 (CPU inference; training continues)
 ```text
 Visk Web UI: http://127.0.0.1:8765 (CPU inference; training continues)
 分享链接（最多 10 桌，进入时需输入口令）: http://192.168.1.3:8765/?k=<随机串>
+观战链接（只读，不占棋桌）: http://192.168.1.3:8765/watch?w=<随机串>
 正在为公网访问启动 Cloudflare 隧道（cloudflared 需能连上外网）……
 
 公网访问口令: <随机口令>
 公网邀请链接: https://<随机域名>.trycloudflare.com/?k=<随机串>
+公网观战链接: https://<随机域名>.trycloudflare.com/watch?w=<随机串>
 ```
 
-把**链接和口令一起**发给对方即可。要点：
+把**邀请链接和口令**发给对弈的人，把**观战链接**发给只看不下的人即可。要点：
 
 - **口令是自动生成的**。公网等于把棋桌交给陌生人，所以 `--public` 不会开一个无口令的分享；也可以用 `--password <口令>` 指定自己的。口令只挡入口（一次输入换 Cookie），邀请串本身仍是一次性门票，两者拿到任一个都能进，所以两个都要给对人。
-- **同一份服务，两种访客**。隧道访客拿到 `https://<隧道域名>/?k=…`（页面按请求的 `Host` 和 `X-Forwarded-Proto` 生成），局域网访客拿到的仍是启动时打印的 `http://192.168.1.3:8765/?k=…`。不需要手写 `--trusted-host`：`--public` 只放行这次隧道真正拿到的域名。
+- **同一份服务，两种访客**。隧道访客拿到 `https://<隧道域名>/?k=…`（页面按请求的 `Host` 和 `X-Forwarded-Proto` 生成，观战链接同理是 `/watch?w=…`），局域网访客拿到的仍是启动时打印的 `http://192.168.1.3:8765/?k=…`。不需要手写 `--trusted-host`：`--public` 只放行这次隧道真正拿到的域名。
 - **隧道连不上就整体退出**，不会留下一个你以为已经公开、其实没公开的服务；这里默认等 40 秒，可用 `--tunnel-timeout` 调整。
 - **域名每次重启都会变**，quick tunnel 不保证可用性；Cloudflare 自己也会提示新域名“可能需要一点时间才能访问”（实测本机 DNS 生效约 20 秒）。cloudflared 不在 PATH 时用 `--cloudflared <路径>` 指定，或 `winget install --id Cloudflare.cloudflared`。
 - **Ctrl+C 会把隧道一起关掉**，公网链接立刻失效；隧道进程由服务自己托管，不需要另开窗口。
@@ -231,7 +244,7 @@ Visk Web UI: http://127.0.0.1:8765 (CPU inference; training continues)
 要点：
 
 - **`--trusted-host` 支持两种写法**：写完整名（`board.example.com`）只放行这一个域名（裸域名与本端口两种形式都接受，因为反代会自己决定端口）；以点开头（`.trycloudflare.com`）放行整棵子域，适合每次重启都会换域名的 quick tunnel。
-- **隧道访客拿到的邀请链接会自动换成公网地址**：页面“邀请棋友”面板给出的是 `https://<当前访问域名>/?k=…`（依据请求的 `Host` 与 `X-Forwarded-Proto` 生成），局域网访客看到的仍然是启动时打印的局域网链接。
+- **隧道访客拿到的链接会自动换成公网地址**：页面“邀请与观战”面板给出的邀请链接是 `https://<当前访问域名>/?k=…`、观战链接是 `/watch?w=…`（依据请求的 `Host` 与 `X-Forwarded-Proto` 生成），局域网访客看到的仍然是启动时打印的局域网链接。
 - **quick tunnel 自带域名随机**，重启 cloudflared 就换地址；`scripts/tunnel-webui.ps1` 会把新地址直接打出来。隧道本身**没有任何鉴权**，所以务必配 `--password`。
 - 启动隧道前请确认 8765 上是**分享实例**：如果端口被一个只绑回环、没加 `--share` 的旧实例占用，隧道会连到它，访客只会看到“Local access only”或单桌无口令的界面。
 
@@ -300,14 +313,18 @@ python main.py train --rule renju --hours 2 --output runs/renju-experiment --res
 
 - 15×15；输入当前方棋子、对方棋子、当前是否执黑三个平面。
 - 网络由 `arch` 选择，`vk/network.py` 的 `ARCHITECTURES` 是唯一真源（宽度 + `R`/`T` 块序字符串），块数与 Transformer 块数都从该字符串派生，名字与实际层不可能不一致。默认 `hybrid-128-10`：128 通道、10 个 block、排列 `RRTRRTRRTR`，即 7 个残差块 + 3 个 Transformer 块，约 **2.80 M** 参数。残差块为 `Conv3×3 → BN → ReLU → Conv3×3 → BN` 加残差后 ReLU；Transformer 块为 Pre-LN + 8 头自注意力 + `128→512→128` GELU MLP，带 **2D 相对位置偏置**（每头一张 29×29 表，按 `(dr, dc)` 取用）且**没有 CLS token**，token 就是 225 个棋盘点。`legacy-64-6` 是改造前的 64 通道 6 残差块网络，按参数名逐字保留，仅用于继续加载旧 checkpoint（见下）。
-- 策略与价值共用整个主干；策略输出 225 个 logits（MCTS 侧再取 softmax），价值输出 `tanh` 到 `[-1, 1]`。价值头在主干上做全局平均池化后接 `128→64→1`：原实现把 `1×15×15` 摊平成 225 维再送进线性层，批量大小为 1 时会塌成一维，而 MCTS 正是逐个叶子做单点推理。
-- PUCT 系数 2，每步 200 次新搜索；复用子树和已有访问次数。每个节点依次保留全部一步胜、全部强制成四（四子且两端皆空，对手一子堵不住两个成五点）或全部一步防，否则使用 `square3_line4` 邻域候选；空盘只走中心，候选为空才退回全部合法点。三种收窄分别记为 `forced_win`、`strategic`、`forced_defense`。
+- 策略与价值共用整个主干；策略输出 225 个 logits（MCTS 侧再取 softmax），价值输出 `tanh` 到 `[-1, 1]`。价值头在主干上做全局平均池化后接 `128→64→1`：原实现把 `1×15×15` 摊平成 225 维再送进线性层，批量大小为 1 时会塌成一维，而 MCTS 正是逐个叶子做单点推理。**现在是三个头**（`final`/`mid`/`short`，见「数据格式 4」），搜索叶值取 `search_value_mix` 的加权（默认 final 0.5 + mid 0.5），因此 Q 不再由同一个饱和标量决定。
+- PUCT 系数 2，每步 `simulations` 次新搜索；复用子树和已有访问次数。**硬约束只覆盖确定性战术**：有一步成五就走成五，否则对手有五就必挡，其余全部合法点都可达；成四威胁与棋子邻域改成**加在 logits 上的软偏置**（`search_bias_four=2.0`、`search_bias_neighbour=0.5`），不再把 heuristic 没看上的点永久排除。空盘只把先验压向中心。
+- **Playout Cap Randomization**：每个着法按 `cheap_search_prob=0.75` 抽预算——full 用 `simulations`（默认 400），cheap 用 `cheap_search_simulations`（默认 64，且不会超过 full）。只有 full 着法监督策略头（`cheap_search_target_weight=0.0`），cheap 着法只贡献 value 数据；硬规则只剩一个候选点的着法跑 1 次模拟但仍产出 value。
+- **策略目标先修正噪声再剪枝**：`policy_noise_correction` 先扣掉 Dirichlet 探索的期望访问量，`policy_target_prune_prop=0.02` / `policy_target_prune_min_count=2` 再丢掉搜索没真正展开的子节点，最后归一化。损失里再加一项 `policy_soft_temperature=2.0` 的软目标（`policy_soft_weight=0.25`），避免策略头塌到单一着法。
+- **回放按 surprise 加权采样**：`policy_surprise`/`value_surprise` 在生成时写入记录，采样权重 `w = (1-0.5) + 0.5·clip(s/1.0, 0, 5)`（`surprise_uniform_share`/`surprise_ref`/`surprise_cap`），既有下限也有上限，异常样本无法支配批次。权重、均值与上限都进每轮指标。
 - 每局不空盘开始，而是由 `balanced_opening` 采样 8 手平衡开局（前 4 手全盘随机，其后只落在已有棋子的邻域内），自我对弈、champion 晋级赛与 Rapfi 评测共用同一采样器与同一手数，因此评价与训练面对同一分布。空手数（`opening_plies: 0`）可退回空盘开局做对照。
-- 自我对弈根节点使用 25% Dirichlet 噪声，alpha=0.3；前 20 手按根访问次数分布采样，之后取最大访问次数。
+- 自我对弈根节点使用 25% Dirichlet 噪声，总浓度 10.83（每个合法点 alpha = 10.83/候选数）；噪声**只加在 full 着法上**。前 20 手按根访问次数分布采样，之后取最大访问次数。
 - 每轮冻结模型，默认 16 个 Windows spawn CPU 对局进程生成 32 局；主进程将请求合并成 GPU 批次，批次等待最多约 3ms。RTX 5070 Ti 实测在 4 worker 时 CPU 与 GPU 都未充分利用，因此提高并发；可用 `--workers` 按机器负载调整。`hybrid-128-10` 单点前向约 2.2 ms（旧 64×6 约 1.0 ms），批次窗口相对变紧，改 `--workers` 或 `simulations` 之前先看每轮的 `average_inference_batch_size`。
 - 采样结束再训练 200 步，批大小 256，最近 100,000 个局面回放；Adam 学习率 0.001，L2 系数 0.0001，梯度范数上限 5。回放池达到 `min_replay_size` 前不更新参数，因此该阈值必须**明显低于**单轮产出（含被时间预算切短的轮次），否则训练永远不会开始——每轮指标里的 `trainable` 与 `min_replay_size` 就是给这件事留的观测口。
 - 旧式随机启动仍按终局胜负训练；混合配置从 Rapfi 教师预训练权重开始，但正式运行时不调用教师。自博弈始终由已晋级 champion 生成，每 5 轮候选网络先过战术门槛，再以交换执色开局对 champion 做最多 100 组顺序检验；Wilson 95% 下界超过 50% 才晋级，否则恢复 champion 网络及优化器快照。
-- 优化策略交叉熵加价值均方误差，优化器执行 L2 正则；旋转/镜像同时作用于棋盘和策略，执黑平面不变。
+- 损失由 `vk/objective.py` 统一拼装：`policy_weight=1.0` 的硬目标交叉熵 + 0.25 的软目标项，加三个 value head 的**掩码均方误差**（`value_weight_final=1.0`、`value_weight_mid=0.5`、`value_weight_short=0.25`）。某个 head 在这批数据里没有有效行时它**不贡献梯度**，而不是被拉向 0。训练与预训练调用同一个函数，权重只写在 `vk/config.py` 一处；优化器执行 L2 正则，旋转/镜像同时作用于棋盘和策略，执黑平面不变。
+- 每轮 `metrics.jsonl` 都带诊断：各 head 的**目标饱和**（`mean|v|`、`|v|>0.9`、`|v|<0.5`）与**预测饱和**、策略目标熵与网络熵、`kl_target_prior`（搜索比先验多出的信息）与 `kl_target_network`（目标相对当前网络有多陈旧）、`q_spread_mean`（兄弟 Q 扩散）、`policy_valid_share`/`full_search_share`（PCR 生效情况）、`horizon_bootstrap_share`（地平线是否真的截断到游戏内部）、surprise 与采样权重分布。字段清单由 `vk/diagnostics.py` 决定。
 
 超参数是可运行起点，不代表已完成调优。无禁手普通开局的先手优势极大，空盘自我对弈会退化成一色通吃，因此训练从平衡开局开始；即便如此也仍要分别报告黑白成绩，不能只看自我对弈胜率或训练损失判断棋力。
 
@@ -317,9 +334,11 @@ python main.py train --rule renju --hours 2 --output runs/renju-experiment --res
 
 如果时长到达时不足 32 局，已完成的局面仍会保存。如果当前轮有未完成的参数更新，检查点记录 `pending_steps`；下次续训先完成这些更新，再开始下一轮采样。因此短时分段训练不会一直只采样而没有更新。若连一局都没完成，不写入伪造和棋标签。
 
-每轮原子保存一个完整检查点，保留最近三个。检查点包含网络、优化器、配置、回放池、总对局数、轮数、训练步数、待完成更新及随机数状态。续训允许通过 `--workers` 调整自对弈并发数，其他配置仍需与检查点一致。进程调度和 GPU 运算会影响数值及样本到达顺序，因此恢复保证训练状态连续，不承诺逐位可复现。
+每轮原子保存一个完整检查点（format 2），保留最近三个。检查点包含网络、优化器、配置、**结构化回放数组**、总对局数、轮数、训练步数、待完成更新及随机数状态。续训允许通过 `--workers` 调整自对弈并发数，其他配置仍需与检查点一致；`vk/config.RESUME_FREE` 是允许变化的全部字段。进程调度和 GPU 运算会影响数值及样本到达顺序，因此恢复保证训练状态连续，不承诺逐位可复现。
 
 **换架构必须从零重训。** 检查点里记录 `arch`，`--init-checkpoint` 与续训都会比对它；改造前写下的检查点没有这个键，会按 `channels`/`blocks` 反推成 `legacy-64-6`，因此旧的 64×6 权重不会被误当成新网络的初始化，而是明确报 `architecture mismatch`。要把旧运行当对照，用 `--checkpoint`（推理）读取即可——`Network` 会按该检查点自己的 `arch` 重建对应网络族。
+
+**format-1 旧检查点仍可推理，也可以做冷启动初始化**：`vk/storage.upgrade_format1()` 把旧的单个 value head 原样当作 final head，并用它的权重初始化 `mid`/`short`（网络一开始在三个地平线上给出同一个值，而不是从噪声开始）；旧的回放池是没有 schema 的元组列表，升级时直接丢弃。因此 format-1 检查点**不能续训**（续训要求 format 2，会明确报错），但 `--init-checkpoint`、`evaluate --checkpoint` 与 Web UI 都能继续读它。`vk/storage.load_model_state()` 是唯一读旧检查点的地方。
 
 只加载本项目生成且可信的 `.pt` 文件：完整恢复使用 Python pickle。`best.pt` 是推理权重，不含优化器和回放池，不能用于续训；续训使用 `latest` 或完整 `checkpoint-*.pt`。已有训练目录要求显式 `-Resume`，不会覆盖为新训练。
 
@@ -331,7 +350,7 @@ runs/renju/                  连珠模型、回放和日志
   config.json               当前配置
   checkpoint-*.pt           最近三个完整检查点
   best.pt                   当前已晋级 champion 的推理权重
-  metrics.jsonl             时间、吞吐、损失、候选/搜索统计、分色胜率、开局统计和晋级结果
+  metrics.jsonl             时间、吞吐、损失、搜索/目标/预测诊断、分色胜率、开局统计和晋级结果
   games.jsonl               已完成对局的落点与结果
   evaluations.jsonl         训练中的定期评估
   evaluation-*.json         手动评估报告
@@ -351,13 +370,37 @@ python main.py doctor
 # 小模型/低搜索预算的短跑，只用于功能验收
 python main.py train --rule freestyle --config configs/smoke.json --output artifacts/my-smoke-freestyle --hours 0.04 --max-rounds 1
 python main.py train --rule renju --config configs/smoke.json --output artifacts/my-smoke-renju --hours 0.04 --max-rounds 1
+
+# 同一 checkpoint 自己对自己：一侧搜索、一侧纯策略（搜索到底有没有用的判据）
+python main.py evaluate --rule freestyle --checkpoint best --output runs/freestyle-pretrain --opponent self-policy --pairs 25 --minutes 120
 ```
 
-测试覆盖四方向胜负、长连、真假三三、同方向/交叉双四、边界与满盘、合法动作、搜索回传符号、立即取胜和必要防守、增强对齐、完整对局标签、实际参数更新、断点恢复、停止、规则隔离和 worker 异常传播。
+测试覆盖四方向胜负、长连、真假三三、同方向/交叉双四、边界与满盘、合法动作、搜索回传符号、立即取胜和必要防守、增强对齐、完整对局标签、实际参数更新、断点恢复、停止、规则隔离和 worker 异常传播；重构后又补了 schema/目标构造/回放采样/损失掩码/配置校验/诊断/PCR/软偏置/search-gap 八组纯函数测试。
 
-实现分层：`main.py` 是统一命令入口；`vk/game.py` 为规则；`vk/search.py` 为 MCTS；`vk/selfplay.py` 为多进程采样；`vk/network.py` 为网络和推理；`vk/training.py` 为优化与恢复；`vk/evaluation.py` 为对战评估；`vk/cli.py` 负责命令解析。
+实现分层（一个模块一件事）：
 
-方法参考：[AlphaGo Zero](https://deepmind.google/blog/alphago-zero-starting-from-scratch/)、[DeepMind OpenSpiel AlphaZero](https://github.com/google-deepmind/open_spiel/blob/master/docs/alpha_zero.md)、[PyTorch CUDA 安装](https://pytorch.org/get-started/previous-versions/)。本项目是针对五子棋的简化 AlphaZero 系统，不是原论文计算规模或完整实现的复刻。
+| 模块 | 职责 |
+|---|---|
+| `vk/game.py` | 规则与终局裁决 |
+| `vk/candidates.py` | 确定性硬约束 + 经验性软偏置 |
+| `vk/targets.py` | 纯 numpy 目标构造：剪枝 / 去噪 / 软目标 / 多尺度 value / surprise 权重 |
+| `vk/search.py` | PUCT、子树复用、PCR 预算、SearchResult |
+| `vk/records.py` | position schema 唯一真源 + D4 增广 + 旧格式归一化 |
+| `vk/selfplay.py` | 多进程采样与集中批量推理 |
+| `vk/replay.py` | 结构化回放 + surprise 加权采样 |
+| `vk/network.py` | 网络结构与批量推理（`Evaluator`） |
+| `vk/objective.py` | 损失与权重（训练/预训练共用） |
+| `vk/training.py` | 轮循环：采样→更新→晋级→保存 |
+| `vk/storage.py` | 检查点与 jsonl；format-1 升级 |
+| `vk/config.py` | 配置真源、校验、resume 兼容 |
+| `vk/diagnostics.py` | 饱和 / 熵 / KL / Q 扩散 / 回合报告 |
+| `vk/datasets.py` | NPZ 分片读写与合并 |
+| `vk/pretraining.py` | Rapfi 冷启动监督训练 |
+| `vk/teacher.py` | 教师对局生成（Rapfi 进程协议） |
+| `vk/evaluation.py` | 对战、配对区间、战术门槛、search-gap |
+| `vk/cli.py` / `vk/webui.py` | 命令入口 / 本地 UI |
+
+方法参考：[AlphaGo Zero](https://deepmind.google/blog/alphago-zero-starting-from-scratch/)、[DeepMind OpenSpiel AlphaZero](https://github.com/google-deepmind/open_spiel/blob/master/docs/alpha_zero.md)、[KataGo](https://github.com/lightvector/KataGo)（PCR、surprise 加权、prune 后的软策略目标）、[PyTorch CUDA 安装](https://pytorch.org/get-started/previous-versions/)。本项目是针对五子棋的简化 AlphaZero 系统，只借 KataGo 的思路（多尺度 value、PCR、soft policy、surprise 采样），不复制它的复杂度：没有 ownership/score head、没有 PDA、没有盘面历史平面。
 
 ## 开源协议
 

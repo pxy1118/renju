@@ -12,10 +12,10 @@ import numpy as np
 import pytest
 
 from vk.evaluation import evaluate_rapfi, opening
-from vk.network import Network
+from vk.network import Inference, Network
 from vk.openings import balanced_opening, book_opening, load_opening_book
 from vk.selfplay import play_game
-from vk.training import DEFAULTS
+from vk.config import DEFAULTS
 
 
 def make_book(path, rule="freestyle", seeds=(1, 2), gap=0.15):
@@ -138,8 +138,10 @@ def test_self_play_can_start_from_the_book(tmp_path):
     make_book(tmp_path / "book.json", seeds=(3,))
     loaded = load_opening_book(tmp_path / "book.json")
     recorded = [int(action) for action in loaded["openings"][0]["moves"]]
-    data, stats = play_game("freestyle", lambda state: (np.zeros(225), 0.0), 2, 0,
-                            book=loaded)
+    cfg = dict(DEFAULTS, rule="freestyle", arch="hybrid-8-1", channels=8, blocks=1,
+               simulations=2, workers=1, opening_plies=0)
+    data, stats = play_game(cfg, lambda state: Inference.leaf_value(np.zeros(225), 0.0),
+                            0, book=loaded)
     assert stats["opening"] == recorded
     assert stats["moves"][:len(recorded)] == recorded
     assert len(data) >= 1

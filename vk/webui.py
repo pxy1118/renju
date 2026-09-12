@@ -8,6 +8,10 @@ player owns a private table instead of fighting over one shared board.
 ``--public`` adds the third: a Cloudflare quick tunnel started alongside the
 server, whose randomly assigned hostname is admitted into the Host fence and
 printed as one ready-to-open link.
+
+Every share also prints a read-only ``/watch`` link. It mirrors every game in
+progress for spectators, who hold no table and no CSRF token, so watching can
+never move a stone or consume one of the seats.
 """
 from concurrent.futures import ThreadPoolExecutor
 from http import HTTPStatus
@@ -28,7 +32,9 @@ import torch
 from .game import Game
 from .network import Network, Evaluator, architecture_of
 from .search import MCTS
-from .training import load_checkpoint
+from .config import mix_vector
+from .search import search_options
+from .storage import load_model_state
 from .tunnel import Tunnel, TunnelError
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -45,8 +51,22 @@ CHECKPOINT_HELP = "请让训练保存检查点后再试（每轮结束时写入�
 LAN_SESSION_LIMIT = 10
 ALL_INTERFACES = "0.0.0.0"
 SESSION_COOKIE = "renju_session"
+WATCH_COOKIE = "renju_watch"
 TOKEN_QUERY = "k"
+WATCH_QUERY = "w"
 CONFIG_TTL_SECONDS = 2.0
+PLAYER_ASSETS = {"/": ("index.html", "text/html"),
+                 "/app.js": ("app.js", "text/javascript"),
+                 "/board.js": ("board.js", "text/javascript"),
+                 "/style.css": ("style.css", "text/css")}
+WATCH_ASSETS = {"/watch": ("watch.html", "text/html"),
+                "/watch.js": ("watch.js", "text/javascript")}
+# The watch page shares the stylesheet and the board code with the player
+# page: a player's browser never holds a watch cookie and a spectator's never
+# holds a session, so exactly these two files accept either credential.
+SHARED_ASSETS = ("/style.css", "/board.js")
+WATCH_SERVED = dict(WATCH_ASSETS, **{name: PLAYER_ASSETS[name] for name in SHARED_ASSETS})
+WATCH_ROUTES = ("/watch", "/watch.js", "/api/watch", *SHARED_ASSETS)
 
 
 def routed_ipv4():
@@ -194,6 +214,11 @@ def invite_url(host, port, key):
     return f"http://{host}:{port}/?{TOKEN_QUERY}={key}"
 
 
+def watch_url(host, port, key):
+    """The read-only link: mirrors the games in progress, moves nothing."""
+    return f"http://{host}:{port}/watch?{WATCH_QUERY}={key}"
+
+
 class Table:
     def __init__(self, root=ROOT / "runs", catalog=None, sessions=0):
         self.root = Path(root)
@@ -308,11 +333,12 @@ class Table:
             root = self.root.resolve()
             if not path.is_relative_to(root) or checkpoint not in {item["name"] for item in self.catalog(rule)}:
                 raise FileNotFoundError(checkpoint)
-            state = load_checkpoint(path, rule)
+            state = load_model_state(path, rule)
             cfg = state["config"]
             model = Network(architecture_of(cfg))
             model.load_state_dict(state["model"])
-            self.tree = MCTS(Evaluator(model, "cpu"), simulations, cfg["cpuct"])
+            self.tree = MCTS(Evaluator(model, "cpu", mix=mix_vector(cfg)), simulations,
+                         cfg["cpuct"], **search_options(cfg))
             with self.lock:
                 self.info.update(file=checkpoint, step=state.get("step"), round=state.get("round"))
             del state
@@ -438,7 +464,10 @@ class Catalog:
             key = (str(path.resolve()), stat.st_mtime_ns, stat.st_size)
             if key not in self.checkpoint_cache:
                 state = torch.load(path, map_location="cpu", weights_only=False)
-                found = state.get("config", {}).get("rule") if state.get("format") == 1 else None
+                # Every format this project writes carries its rule in the config;
+                # the format check that used to be here predates format 2 and hid
+                # a distilled run from the model list.
+                found = state.get("config", {}).get("rule")
                 self.checkpoint_cache[key] = found if found in RULES else None
             return self.checkpoint_cache[key]
         except Exception:
@@ -539,6 +568,9 @@ def make_server(port=8765, root=ROOT / "runs", host="127.0.0.1", share=False,
     table = Table(root, catalog=catalog, sessions=1)
     request_token = secrets.token_hex(24)
     join_key = secrets.token_urlsafe(18)
+    # Spectators get their own ticket: the watch link is read-only, so it
+    # neither consumes a table slot nor ever satisfies a play route.
+    watch_key = secrets.token_urlsafe(18)
     # Filled in after the bind, because port 0 only becomes a real port then.
     fence = set()
     configs = {}
@@ -594,6 +626,27 @@ def make_server(port=8765, root=ROOT / "runs", host="127.0.0.1", share=False,
         if address is None:
             return None
         return invite_url(address, port_number or port, join_key)
+
+    def watch(port_number=None):
+        """Read-only spectate link, or None when this bind is not reachable."""
+        if not share:
+            return None
+        address = guest_address()
+        if address is None:
+            return None
+        return watch_url(address, port_number or port, watch_key)
+
+    def watch_state():
+        """Every game in progress, in table order, for the watch page feed.
+
+        A spectator owns no table, so this is read-only by construction: the
+        payload carries positions and history, while every mutating route
+        still demands a session cookie the watch page never had.
+        """
+        with sessions.lock:
+            tables = sorted(sessions.tables.values(), key=lambda item: item.sessions)
+        playing = [item.snapshot() for item in tables]
+        return {"tables": [snap for snap in playing if snap["id"] is not None]}
 
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
@@ -652,19 +705,59 @@ def make_server(port=8765, root=ROOT / "runs", host="127.0.0.1", share=False,
             the LAN address in the printed link would not resolve for it. Direct
             LAN visitors keep the address the operator printed at startup.
             """
+            origin = self.proxied_origin()
+            return None if origin is None else f"{origin}/?{TOKEN_QUERY}={join_key}"
+
+        def public_watch(self):
+            """The spectate link on this request's own origin, same as invites."""
+            origin = self.proxied_origin()
+            return None if origin is None else f"{origin}/watch?{WATCH_QUERY}={watch_key}"
+
+        def proxied_origin(self):
+            """``scheme://authority`` of this request when a proxy served it."""
             authority = self.proxied_authority()
             if authority is None:
                 return None
             forwarded = self.headers.get("X-Forwarded-Proto", "").lower()
             scheme = "https" if forwarded == "https" or self.server.server_port in (80, 443) else "http"
-            return f"{scheme}://{authority}/?{TOKEN_QUERY}={join_key}"
+            return f"{scheme}://{authority}"
 
-        def cookie(self):
+        def cookie(self, name=SESSION_COOKIE):
             for chunk in self.headers.get("Cookie", "").split(";"):
-                name, _, value = chunk.strip().partition("=")
-                if name == SESSION_COOKIE:
+                key, _, value = chunk.strip().partition("=")
+                if key == name:
                     return value
             return None
+
+        def watch_header(self):
+            return ("Set-Cookie",
+                    f"{WATCH_COOKIE}={watch_key}; Path=/; HttpOnly; SameSite=Strict; Max-Age=604800")
+
+        def watch_route(self, path):
+            """Serve the read-only spectate page: HTML, script, and live feed.
+
+            A spectator owns no table and never sees the CSRF token, so every
+            play route keeps refusing them; the watch credential only ever
+            reads. The ticket in the link is exchanged for a cookie exactly
+            like an invite key, so it leaves the address bar after one visit.
+            """
+            key = self.query().get(WATCH_QUERY, "")
+            granted = bool(key and hmac.compare_digest(key, watch_key)) or \
+                bool(hmac.compare_digest(self.cookie(WATCH_COOKIE) or "", watch_key))
+            if granted:
+                if key and path == "/watch":
+                    return self.redirect("/watch", [self.watch_header()])
+            elif not (path in SHARED_ASSETS and sessions.fetch(self.cookie()) is not None):
+                if path == "/api/watch":
+                    return self.send(HTTPStatus.FORBIDDEN, {"error": "请使用观战链接进入。"})
+                return self.notice(HTTPStatus.FORBIDDEN, "棋间 · 观战需要链接",
+                                   "请使用服务提供者给出的观战链接进入。观战是只读的，也不会占用棋桌。")
+            if path == "/api/watch":
+                return self.send(HTTPStatus.OK, watch_state())
+            if path not in WATCH_SERVED:
+                return self.send(HTTPStatus.NOT_FOUND, {"error": "Not found"})
+            name, kind = WATCH_SERVED[path]
+            self.send(HTTPStatus.OK, (STATIC / name).read_bytes(), kind + "; charset=utf-8")
 
         def cookie_header(self, token):
             return ("Set-Cookie",
@@ -772,12 +865,14 @@ def make_server(port=8765, root=ROOT / "runs", host="127.0.0.1", share=False,
         def do_GET(self):
             if not self.host_ok():
                 return self.send(HTTPStatus.FORBIDDEN, {"error": "Local access only"})
+            path = urlparse(self.path).path
+            if sessions is not None and path in WATCH_ROUTES:
+                return self.watch_route(path)
             mine = self.admit()
             if self.answered:  # the password form or the invite exchange replied
                 return
             if mine is None:
                 return
-            path = urlparse(self.path).path
             if path == "/api/state":
                 return self.send(HTTPStatus.OK, mine.snapshot())
             if path == "/api/config":
@@ -786,13 +881,12 @@ def make_server(port=8765, root=ROOT / "runs", host="127.0.0.1", share=False,
                     payload.update(share=True, sessions=sessions.count(),
                                    max_sessions=sessions.maximum, password=bool(password),
                                    invite=self.public_invite() or invite(self.server.server_port),
+                                   watch=self.public_watch() or watch(self.server.server_port),
                                    invite_reachable=guest_address() is not None)
                 return self.send(HTTPStatus.OK, payload)
-            assets = {"/": ("index.html", "text/html"), "/app.js": ("app.js", "text/javascript"),
-                      "/style.css": ("style.css", "text/css")}
-            if path not in assets:
+            if path not in PLAYER_ASSETS:
                 return self.send(HTTPStatus.NOT_FOUND, {"error": "Not found"})
-            name, kind = assets[path]
+            name, kind = PLAYER_ASSETS[path]
             self.send(HTTPStatus.OK, (STATIC / name).read_bytes(), kind + "; charset=utf-8")
 
         def do_POST(self):
@@ -845,6 +939,8 @@ def make_server(port=8765, root=ROOT / "runs", host="127.0.0.1", share=False,
     server.tunnel_host = None
     server.invite_key = join_key
     server.invite = invite
+    server.watch_key = watch_key
+    server.watch = watch
     return server
 
 
@@ -873,6 +969,7 @@ def serve(port=8765, root=ROOT / "runs", open_browser=True, host="127.0.0.1", sh
         else:
             note = "，进入时需输入口令" if password else ""
             print(f"分享链接（最多 {server.sessions.maximum} 桌{note}）: {link}", flush=True)
+            print(f"观战链接（只读，不占棋桌）: {server.watch(server.server_port)}", flush=True)
     if public:
         print(f"正在为公网访问启动 Cloudflare 隧道（cloudflared 需能连上外网）……", flush=True)
         try:
@@ -888,8 +985,9 @@ def serve(port=8765, root=ROOT / "runs", open_browser=True, host="127.0.0.1", sh
         print("", flush=True)
         print(f"公网访问口令: {password}", flush=True)
         print(f"公网邀请链接: {tunnel_link}/?{TOKEN_QUERY}={server.invite_key}", flush=True)
-        print("把这个链接和口令一起发给对方即可；隧道关闭或 Ctrl+C 后链接立即失效。"
-              "公网访客会各自拿到一张独立棋桌。", flush=True)
+        print(f"公网观战链接: {tunnel_link}/watch?{WATCH_QUERY}={server.watch_key}", flush=True)
+        print("把邀请链接和口令发给对弈的人，把观战链接发给只看不下的人（观战不占棋桌，也无法落子）；"
+              "隧道关闭或 Ctrl+C 后链接立即失效。公网访客会各自拿到一张独立棋桌。", flush=True)
         print("", flush=True)
     if open_browser:
         import webbrowser

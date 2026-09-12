@@ -1,20 +1,11 @@
 const $ = id => document.getElementById(id);
 let state = null, token = '', config = {models:{}, recent:{}, ready:false, share:false, max_sessions:0}, selection = 'latest', color = 'black';
 let pending = false, revision = 0, disconnected = false, lastMoveSeconds = null;
-const letters = 'ABCDEFGHIJKLMNO';
-const cells = [];
-for (let i = 0; i < 225; i++) {
-  const r = Math.floor(i / 15), c = i % 15, b = document.createElement('button');
-  b.className = 'point' + (r === 0 ? ' top' : '') + (r === 14 ? ' bottom' : '') + (c === 0 ? ' left' : '') + (c === 14 ? ' right' : '') + ([48,56,112,168,176].includes(i) ? ' star' : '');
-  b.innerHTML = `<span class="piece"></span>${r === 0 ? `<span class="coord col">${letters[c]}</span>` : ''}${c === 0 ? `<span class="coord row">${r+1}</span>` : ''}`;
-  b.setAttribute('aria-label', `${letters[c]}${r+1}，空位`);
-  b.addEventListener('click', () => {
-    if (!state || pending || state.busy || state.error || state.winner !== null || state.player !== state.human) return;
-    if (!state.legal.includes(i)) { showError('这里不能落子：已占用或不符合当前规则。'); return; }
-    mutate('/api/move', {id: state.id, action: i});
-  });
-  cells.push(b); $('board').appendChild(b);
-}
+const cells = buildBoard($('board'), i => {
+  if (!state || pending || state.busy || state.error || state.winner !== null || state.player !== state.human) return;
+  if (!state.legal.includes(i)) { showError('这里不能落子：已占用或不符合当前规则。'); return; }
+  mutate('/api/move', {id: state.id, action: i});
+});
 function showError(message) { $('error').textContent = message || ''; $('error').hidden = !message; }
 function ruleName(rule) { return rule === 'renju' ? '连珠' : '自由五子棋'; }
 async function api(path, data) {
@@ -51,6 +42,9 @@ function showShare() {
   if ($('invite').value !== (config.invite || '')) $('invite').value = config.invite || '';
   $('invite-note').textContent = !config.invite ? '当前地址别人访问不到：请用 --host <局域网IP> 启动服务。'
     : config.password ? '对方打开链接后需要再输入访问口令。' : '对方打开链接即可入局。';
+  if ($('watch').value !== (config.watch || '')) $('watch').value = config.watch || '';
+  $('watch-note').textContent = !config.watch ? '当前地址别人访问不到：请用 --host <局域网IP> 启动服务。'
+    : '观战是只读的：能看到所有正在进行的对局，不能落子，也不占棋桌。';
 }
 // A selection is usable when it is an alias the server resolves or a file it listed.
 function checkpointFile(rule, wanted) {
@@ -110,13 +104,10 @@ function winningLine(state) {
 function render() {
   if (!state) return;
   const s = state, busy = pending || s.busy, active = !!s.id;
-  const moveNumbers = new Map(s.history.map((a, i) => [a, i+1]));
   const winners = winningLine(s);
+  paintStones(cells, s, winners, $('numbers').checked);
   cells.forEach((b, i) => {
-    const v = s.board[i], p = b.querySelector('.piece');
-    p.className = 'piece' + (v ? (v === 1 ? ' black' : ' white') : '') + (s.history.at(-1) === i ? ' last' : '');
-    p.classList.toggle('win', winners.has(i));
-    p.textContent = v && $('numbers').checked ? moveNumbers.get(i) : '';
+    const v = s.board[i];
     const legal = active && !busy && !s.error && s.winner === null && s.player === s.human && s.legal.includes(i);
     b.classList.toggle('legal', legal);
     b.setAttribute('aria-disabled', String(!legal));
@@ -163,13 +154,15 @@ $('new').onclick = () => {
   mutate('/api/new', {rule:$('rule').value, color, checkpoint:selection, simulations:Number($('simulations').value)});
 };
 $('undo').onclick = () => mutate('/api/undo', {id:state.id});
-$('invite-copy').onclick = async () => {
-  const link = $('invite').value;
+async function copyLink(inputId, buttonId) {
+  const link = $(inputId).value;
   if (!link) return;
-  try { await navigator.clipboard.writeText(link); $('invite-copy').textContent = '已复制'; }
-  catch (e) { $('invite').select(); showError('浏览器不允许自动复制，请手动复制上面的链接。'); }
-  setTimeout(() => { $('invite-copy').textContent = '复制'; }, 1500);
-};
+  try { await navigator.clipboard.writeText(link); $(buttonId).textContent = '已复制'; }
+  catch (e) { $(inputId).select(); showError('浏览器不允许自动复制，请手动复制上面的链接。'); }
+  setTimeout(() => { $(buttonId).textContent = '复制'; }, 1500);
+}
+$('invite-copy').onclick = () => copyLink('invite', 'invite-copy');
+$('watch-copy').onclick = () => copyLink('watch', 'watch-copy');
 // Leaving frees the slot for someone else; the next visit asks for the link again.
 $('leave').onclick = async () => {
   if (!confirm('结束本桌？当前棋局会立即丢弃，名额让给其他人。')) return;

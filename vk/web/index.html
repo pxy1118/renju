@@ -22,13 +22,15 @@
 <p class="footnote">新局读取已保存的权重，局中保持固定。后台训练继续运行；CPU 对弈仍会占用少量系统资源。</p></section>
 <section class="panel model-panel"><div class="panel-title"><h2>当前模型</h2><span>02 / MODEL</span></div><div id="model-name">尚未载入</div><div id="model-detail" class="muted">开始对弈后显示检查点信息</div><div class="model-stats"><div><small>推理设备</small><strong>CPU <em>独立进程</em></strong></div><div><small>本局手数</small><strong id="elapsed">—</strong></div></div></section>
 <section class="panel history-panel"><div class="panel-title"><h2>落子记录</h2><span id="history-count">0 MOVES</span></div><div id="history"><p class="muted">棋盘静候第一手。</p></div></section>
-<section class="panel share-panel" id="share-panel" hidden><div class="panel-title"><h2>邀请棋友</h2><span id="share-count">0 / 0 桌</span></div>
-<p class="muted">把链接发给朋友：他在自己的浏览器里独占一张棋桌，各自一局、互不干扰。</p>
+<section class="panel share-panel" id="share-panel" hidden><div class="panel-title"><h2>邀请与观战</h2><span id="share-count">0 / 0 桌</span></div>
+<p class="muted">邀请链接给对弈的人：他在自己的浏览器里独占一张棋桌，各自一局、互不干扰。观战链接只读，能看所有正在进行的对局，不占棋桌。</p>
 <div class="invite"><input id="invite" readonly aria-label="邀请链接"><button id="invite-copy" class="secondary" type="button">复制</button></div>
 <p id="invite-note" class="muted"></p>
+<div class="invite"><input id="watch" readonly aria-label="观战链接"><button id="watch-copy" class="secondary" type="button">复制</button></div>
+<p id="watch-note" class="muted"></p>
 <button id="leave" class="secondary" type="button">结束我的棋桌</button>
 <p class="footnote">链接与棋桌都只在内存中，服务停止即失效；名额满时后来的人会看到“名额已满”。</p></section>
 </aside></div>
 <div id="error" role="alert" hidden></div>
 <footer><span>VISK / HUMAN × MACHINE</span><span>十五路棋盘 · 自我对弈学习</span></footer>
-</main><script src="/app.js"></script></body></html>
+</main><script src="/board.js"></script><script src="/app.js"></script></body></html>

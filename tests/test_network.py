@@ -5,7 +5,8 @@ import torch
 from vk.game import Game
 from vk.network import (ARCHITECTURES, DEFAULT_ARCH, Evaluator, HybridNetwork,
                         LegacyNetwork, Network, Residual, TransformerBlock,
-                        architecture, architecture_of, build, parameter_count)
+                        architecture, architecture_of, build, parameter_count,
+                        value_heads)
 from vk.search import MCTS
 
 
@@ -21,11 +22,11 @@ def test_every_architecture_builds_and_runs(arch):
     assert model.blocks == len(pattern)
     assert model.transformer_blocks == pattern.count("T")
     assert isinstance(model, HybridNetwork if hybrid else LegacyNetwork)
-    policy, value = model.eval()(torch.randn(2, 3, 15, 15))
+    policy, values = model.eval()(torch.randn(2, 3, 15, 15))
     assert policy.shape == (2, 225)
-    assert value.shape == (2,)
-    assert torch.isfinite(policy).all() and torch.isfinite(value).all()
-    assert (value.abs() <= 1).all()
+    assert values.shape == (2, len(value_heads(arch)))
+    assert torch.isfinite(policy).all() and torch.isfinite(values).all()
+    assert (values.abs() <= 1).all()
 
 
 def test_unknown_architecture_is_rejected():
@@ -47,17 +48,42 @@ def test_hybrid_layout_assembles_residuals_and_transformers_in_pattern_order():
 
 
 def test_parameter_budget_is_stable():
-    """Guard the capacity: an accidental change to the layout must be visible."""
-    count = parameter_count(Network("hybrid-128-10"))
-    assert 2_700_000 < count < 2_900_000, count
-    assert count == 2_796_734
+    """Guard the capacity: the trunk must not change, the heads are counted too.
+
+    The multi-scale refactor added value_mid and value_short and nothing else,
+    so the trunk plus policy head is exactly the number the single-head network
+    reported minus its one value head.
+    """
+    model = Network("hybrid-128-10")
+    per_head = 128 * 64 + 64 + 64 + 1
+    trunk_and_policy = 2_796_734 - per_head
+    assert parameter_count(model) == trunk_and_policy + len(value_heads("hybrid-128-10")) * per_head
+    assert parameter_count(model) == 2_813_376
 
 
 def test_single_position_inference_keeps_its_shape():
     """MCTS expands one leaf at a time, so batch size 1 must not collapse."""
-    logits, value = Evaluator(Network(DEFAULT_ARCH).eval(), "cpu")(Game().encode())
-    assert logits.shape == (225,)
-    assert isinstance(value, float) and -1 <= value <= 1
+    inference = Evaluator(Network(DEFAULT_ARCH).eval(), "cpu")(Game().encode())
+    assert inference.policy.shape == (225,)
+    assert inference.values.shape == (len(value_heads(DEFAULT_ARCH)),)
+    assert -1 <= float(inference.head("final")) <= 1
+    assert -1 <= float(inference.leaf()) <= 1
+
+
+def test_every_head_is_readable_by_name_and_the_mix_picks_the_leaf():
+    model = Network(DEFAULT_ARCH).eval()
+    final_only = Evaluator(model, "cpu")
+    mixed = Evaluator(model, "cpu", mix=[0.0, 1.0, 0.0])
+    state = Game().encode()
+    assert final_only(state).leaf() == pytest.approx(float(final_only(state).head("final")))
+    assert mixed(state).leaf() == pytest.approx(float(mixed(state).head("mid")))
+    assert final_only(state).head("short") == mixed(state).head("short")
+    with pytest.raises(ValueError, match="no value head"):
+        model.head_module("score")
+    with pytest.raises(ValueError, match="entries"):
+        Evaluator(model, "cpu", mix=[1.0, 0.0])
+    assert LegacyNetwork().value_heads == ("final",)
+    assert value_heads("hybrid-8-1") == ("final", "mid", "short")
 
 
 def test_relative_position_bias_changes_the_output():
@@ -109,9 +135,9 @@ def test_narrow_architectures_keep_a_usable_head_count():
     assert Network("hybrid-8-1").heads == 1
     assert Network("hybrid-64-3").heads == 4
     model = Network("hybrid-8-1").eval()
-    policy, value = model(torch.randn(3, 3, 15, 15))
-    assert policy.shape == (3, 225) and value.shape == (3,)
-    assert torch.isfinite(policy).all() and torch.isfinite(value).all()
+    policy, values = model(torch.randn(3, 3, 15, 15))
+    assert policy.shape == (3, 225) and values.shape == (3, 3)
+    assert torch.isfinite(policy).all() and torch.isfinite(values).all()
 
 
 def test_odd_width_is_rejected_with_a_clear_error():
@@ -167,8 +193,8 @@ def test_legacy_network_keeps_the_old_parameter_contract():
     # The value head reads the flattened board, which is what the old head did.
     assert model.value[3].in_features == 225
     assert model.transformer_blocks == 0
-    policy, value = model.eval()(torch.randn(1, 3, 15, 15))
-    assert policy.shape == (1, 225) and value.shape == (1,)
+    policy, values = model.eval()(torch.randn(1, 3, 15, 15))
+    assert policy.shape == (1, 225) and values.shape == (1, 1)
 
 
 def test_only_the_legacy_family_is_non_hybrid():
@@ -181,8 +207,8 @@ def test_only_the_legacy_family_is_non_hybrid():
 def test_forward_and_backward_reach_every_parameter():
     torch.set_num_threads(2)
     model = Network("hybrid-8-1")
-    policy, value = model(torch.randn(2, 3, 15, 15))
-    (policy.square().mean() + value.square().mean()).backward()
+    policy, values = model(torch.randn(2, 3, 15, 15))
+    (policy.square().mean() + values.square().mean()).backward()
     missing = [name for name, parameter in model.named_parameters() if parameter.grad is None]
     assert missing == []
 
@@ -197,9 +223,15 @@ def test_search_and_training_accept_the_new_network():
     assert policy.shape == (225,)
     assert policy.sum() == pytest.approx(1.0, abs=1e-5)
 
-    from collections import deque
+    from conftest import position_batch
+    from vk.config import DEFAULTS
+    from vk.replay import ReplayBuffer
     from vk.training import update
-    replay = deque([(Game().encode(), np.full(225, 1 / 225), 1.0)], maxlen=32)
-    metrics = update(Network("hybrid-8-1"), torch.optim.Adam(model.parameters(), lr=1e-3),
-                     replay, 2, "cpu", np.random.default_rng(0))
+    replay = ReplayBuffer(32)
+    replay.extend(position_batch(2))
+    cfg = dict(DEFAULTS, arch="hybrid-8-1", channels=8, blocks=1, batch_size=2)
+    trained = Network("hybrid-8-1")
+    metrics = update(trained, torch.optim.Adam(trained.parameters(), lr=1e-3),
+                     replay, cfg, "cpu", np.random.default_rng(0))
     assert np.isfinite(metrics["loss"])
+    assert metrics["value_loss_final"] is not None and metrics["policy_loss"] > 0

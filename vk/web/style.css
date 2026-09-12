@@ -4,6 +4,9 @@
 /* Share panel: an invite link wide enough to read, plus its own action buttons. */
 .share-panel .invite{display:flex;gap:8px;margin:12px 0 8px}
 .share-panel .invite input{flex:1;min-width:0;font:12px "Consolas",monospace;color:#3d4f47;background:#fff;border:1px solid #dfe4dc;border-radius:6px;padding:9px 10px}
-#invite-note{margin:0 0 12px;font-size:12px}
+/* `.secondary` is width:100% elsewhere in the page; in a link row that would
+   eat the whole line and squeeze the input down to its padding. */
+.share-panel .invite button{width:auto}
+#invite-note,#watch-note{margin:0 0 12px;font-size:12px}
 #leave{margin-top:10px}
 @media (max-width:700px){.share-panel .invite{flex-direction:column}}

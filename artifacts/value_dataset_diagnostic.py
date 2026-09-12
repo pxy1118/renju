@@ -33,7 +33,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from vk.datasets import FORMAT_VERSION, ShardWriter, _split, load_split, topk_valid   # noqa: E402
+from vk.datasets import load_split, topk_valid                 # noqa: E402
 from vk.game import Game                                        # noqa: E402
 
 
@@ -112,6 +112,11 @@ def build_rows(data, limit, stride, engine=None, rule="freestyle", cache=None):
                    "ply": np.uint16(np.count_nonzero(game.board) + 1)}
 
 
+def _write_shard(output, index, rows, fields):
+    np.savez_compressed(output / f"children-{index:05d}.npz",
+                        **{name: np.stack([row[name] for row in rows]) for name in fields})
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -151,25 +156,34 @@ def main():
     output = Path(args.output)
     if output.exists() and any(output.iterdir()):
         raise ValueError(f"Child-value output is not empty: {output}")
+    # The diagnostic writes plain npz shards rather than a training dataset, so
+    # nothing else creates this directory.
+    output.mkdir(parents=True, exist_ok=True)
     engine, cache = None, {}
     if args.engine:
         from vk.rapfi import RapfiClient
         engine = RapfiClient(args.engine, args.engine_dir, args.threads, args.hash_mb,
                              args.max_nodes, args.timeout, 2, rule=args.rule)
     started = time.monotonic()
-    # A child-value row is not a teacher record: it carries the child state and
-    # the target, plus enough provenance to trace a row back to its parent.
+    # This is a diagnostic store, not a training dataset: a row carries the
+    # child state, the target and enough provenance to trace it back to its
+    # parent, which is deliberately not the position schema.
     fields = ("state", "value", "parent", "action", "slot", "parent_winrate", "ply")
+    collected, shards, rows = [], 0, 0
     try:
-        rows, writer, targets = 0, ShardWriter(output, args.shard_size, fields=fields), []
         for row in build_rows(data, args.limit, args.stride, engine=engine,
                               rule=args.rule, cache=cache):
-            writer.add(_split(int(row["parent"])), row)
-            targets.append(float(row["value"]))
+            collected.append(row)
             rows += 1
+            if len(collected) >= args.shard_size:
+                _write_shard(output, shards, collected, fields)
+                shards += 1
+                collected.clear()
             if args.engine and rows % 2000 == 0:
                 print(f"rows={rows} elapsed={time.monotonic() - started:.0f}s", flush=True)
-        writer.close()
+        if collected:
+            _write_shard(output, shards, collected, fields)
+            shards += 1
     finally:
         if engine is not None:
             engine.close()
@@ -177,10 +191,10 @@ def main():
         raise RuntimeError("No child-value rows were produced; does the dataset have top-k data?")
 
     children = np.concatenate([np.load(path, allow_pickle=False)["value"]
-                               for path in sorted(output.rglob("shard-*.npz"))])
+                               for path in sorted(output.rglob("children-*.npz"))])
     diagnostic.update({
         "mode": "fresh" if args.engine else "chained",
-        "rows": rows, "counts": writer.counts, "shards": writer.shards,
+        "rows": int(len(children)), "shards": shards,
         "child_value": saturation(children.astype(np.float64)),
         "elapsed_seconds": time.monotonic() - started,
         "note": ("rows are (child state, value) pairs; two rows of one parent are two "

@@ -12,7 +12,8 @@ import torch
 
 from vk.game import Game, lengths
 from vk.network import Network
-from vk.training import DEFAULTS, atomic_save
+from vk.config import DEFAULTS
+from vk.storage import atomic_save
 from vk.tunnel import hostname_ok, link_hostname, parse_log_line
 from vk.webui import (LAN_SESSION_LIMIT, Sessions, Table, get_local_ipv4, make_server,
                       proxy_patterns, serve, start_tunnel, trusted_host_match)
@@ -219,8 +220,8 @@ def test_http_local_protection_and_validation(models):
         assert config["models"]["renju"]["best"] is None
         assert [item["name"] for item in config["recent"]["renju"]] == [config["models"]["renju"]["latest"]]
         assert config["recent"]["freestyle"][0]["mb"] > 0
-        # An unshared server keeps its original shape: no sessions, no invite.
-        assert "share" not in config and "invite" not in config
+        # An unshared server keeps its original shape: no sessions, no invite, no watch.
+        assert "share" not in config and "invite" not in config and "watch" not in config
         with urlopen(base) as response:
             assert "棋间" in response.read().decode()
         for headers, payload, status in [({}, {}, 403), ({"X-Renju-Token": config["token"]}, [], 400),
@@ -476,8 +477,11 @@ def test_share_accepts_a_trusted_proxy_host(models):
         request.add_header("X-Forwarded-Proto", "https")
         config = json.load(guest.opener.open(request, timeout=15))
         assert config["invite"] == f"https://board.example.test/?k={server.invite_key}"
-        assert json.load(guest.get("/api/config", authority="board.example.test"))["invite"] == \
-            f"http://board.example.test/?k={server.invite_key}"
+        assert config["watch"] == f"https://board.example.test/watch?w={server.watch_key}"
+        assert json.load(guest.get("/api/config", authority="board.example.test"))["watch"] == \
+            f"http://board.example.test/watch?w={server.watch_key}"
+        assert json.load(guest.get("/api/config"))["watch"] == \
+            f"http://{host}:{server.server_port}/watch?w={server.watch_key}"
         assert json.load(guest.get("/api/config"))["invite"].startswith("http://")
         with pytest.raises(HTTPError) as err:
             guest.get("/api/state", authority="board.example.org")   # a lookalike domain
@@ -534,6 +538,72 @@ def test_share_password_page_admits_a_guest(models):
         server.shutdown()
         server.server_close()
         server.sessions.shutdown()
+        thread.join()
+
+
+def test_watch_link_mirrors_games_and_never_plays(shared):
+    """The watch link is a read-only seat: it sees every game, moves none."""
+    server, base, Browser = shared
+    # Strangers are refused, and the invite key is not a watch key...
+    for path in ("/watch", "/watch.js", "/api/watch"):
+        with pytest.raises(HTTPError) as err:
+            Browser(base).get(path)
+        assert err.value.code == 403, path
+    with pytest.raises(HTTPError) as err:
+        Browser(base).get(f"/watch?k={server.invite_key}")
+    assert err.value.code == 403
+    # ...and the watch key is not an invite key: it must never open a table.
+    with pytest.raises(HTTPError) as err:
+        Browser(base).get(f"/?w={server.watch_key}")
+    assert err.value.code == 403
+    assert server.sessions.count() == 0
+
+    watcher = Browser(base)
+    # The watch ticket buys a cookie and leaves the address bar, like an invite.
+    with watcher.get(f"/watch?w={server.watch_key}") as response:
+        assert response.status == 200 and response.geturl() == base + "/watch"
+    with watcher.get("/watch") as response:
+        assert "观战" in response.read().decode()
+    assert json.load(watcher.get("/api/watch")) == {"tables": []}
+    assert server.sessions.count() == 0, "watching must not consume a seat"
+
+    guest = Browser(base)
+    guest.join(server.invite_key)
+    started = guest.api("/api/new", dict(rule="freestyle", color="black", checkpoint="latest", simulations=32))
+    wait_state(guest.state)
+    tables = json.load(watcher.get("/api/watch"))["tables"]
+    assert len(tables) == 1 and tables[0]["id"] == started["id"]
+    # The feed is live: the guest's move shows up on the watcher's board.
+    guest.api("/api/move", dict(id=started["id"], action=112))
+    wait_state(guest.state)
+    tables = json.load(watcher.get("/api/watch"))["tables"]
+    assert tables[0]["board"][112] == 1 and len(tables[0]["history"]) == 2
+    # The watch cookie holds no session and no CSRF token, so every play route
+    # stays shut even with a game id copied straight out of the feed.
+    request = Request(base + "/api/move",
+                      data=json.dumps(dict(id=tables[0]["id"], action=113)).encode())
+    with pytest.raises(HTTPError) as err:
+        watcher.opener.open(request, timeout=15)
+    assert err.value.code == 403
+
+
+def test_watch_routes_need_a_shared_server(models):
+    """Spectating is part of sharing: an unshared server has no /watch at all."""
+    server = make_server(0, models, host="127.0.0.1")
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_port}"
+    try:
+        assert server.watch_key
+        assert server.watch(server.server_port) is None
+        for path in ("/watch", "/watch.js", "/api/watch"):
+            with pytest.raises(HTTPError) as err:
+                urlopen(base + path)
+            assert err.value.code == 404, path
+    finally:
+        server.shutdown()
+        server.server_close()
+        server.table.pool.shutdown()
         thread.join()
 
 
@@ -637,6 +707,7 @@ class FakeServer:
         self.server_port = 8765
         self.sessions = None
         self.invite_key = "test-invite-key"
+        self.watch_key = "test-watch-key"
         self.table = type("T", (), {"pool": type("P", (), {"shutdown": lambda self, **k: None})()})()
         self.tunnel = None
         self.stopped = False
@@ -649,7 +720,7 @@ class FakeServer:
         self.closed = True
 
 
-def test_serve_closes_the_tunnel_when_the_operator_stops_it(monkeypatch):
+def test_serve_closes_the_tunnel_when_the_operator_stops_it(monkeypatch, capsys):
     """Ctrl+C must take the public route down with it, never leave it open."""
     server = FakeServer()
     tunnel = type("K", (), {"stop": lambda self: setattr(server, "stopped", True)})()
@@ -665,4 +736,8 @@ def test_serve_closes_the_tunnel_when_the_operator_stops_it(monkeypatch):
 
     assert server.stopped, "the tunnel outlived the server"
     assert server.closed
+    # The public banner hands out both tickets: one to play, one to watch.
+    out = capsys.readouterr().out
+    assert f"公网邀请链接: https://{BANNER_HOST}/?k=test-invite-key" in out
+    assert f"公网观战链接: https://{BANNER_HOST}/watch?w=test-watch-key" in out
 

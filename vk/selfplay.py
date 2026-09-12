@@ -1,59 +1,161 @@
-"""Spawned CPU actors request inference from one parent GPU process."""
-import copy
+"""Spawned CPU actors request inference from one parent GPU process.
+
+One game produces one structured batch of positions. Each move decides its own
+search budget -- a full search whose policy target is worth supervising, or a
+cheap search that only exists to advance the game and produce value data -- and
+the value targets are built once the game is over, from the per-move search
+values that were collected along the way.
+"""
 import multiprocessing as mp
 import queue
 import signal
 import time
 import traceback
 import numpy as np
+
+from .config import value_horizons
 from .game import Game
+from .network import Inference
 from .openings import balanced_opening, book_opening, load_opening_book, opening_moves
-from .search import MCTS, SearchStopped
+from .records import SOURCE_SELFPLAY, blank
+from .search import MCTS, SearchStopped, search_options
+from .targets import surprise_weights, value_targets
 
 
-def play_game(rule, evaluator, simulations, seed, stop=lambda: False, cpuct=2.0,
-              temperature_moves=20, opening_plies=8, opening=None, book=None):
-    """Play one self-play game, optionally from a supplied opening position.
+def search_plan(cfg, rng):
+    """This move's budget: cheap most of the time, full for a policy target.
 
-    ``opening`` is copied, never mutated: the caller keeps its own game so a
-    paired arena match can hand the same start to both colours. ``book`` takes
-    precedence and walks the book cyclically by ``seed``, so self-play can start
-    from verified balanced positions instead of random stones.
+    The expensive searches are what make a policy target worth learning from;
+    the cheap ones exist so the same compute buys more games, and therefore
+    more value data. Returns (budget, full_search).
+    """
+    full = int(cfg["simulations"])
+    if rng.random() >= float(cfg.get("cheap_search_prob", 0.0)):
+        return full, True
+    # A cheap search is only ever cheaper than the full one: with a small full
+    # budget (smoke runs, tiny tests) the two budgets coincide.
+    cheap = min(full, max(1, int(cfg.get("cheap_search_simulations", 1))))
+    return cheap, False
+
+
+def play_game(cfg, evaluator, seed, stop=lambda: False, book=None, opening=None,
+              game_id=0):
+    """Play one self-play game and return its position records plus statistics.
+
+    book takes precedence over opening, and opening over the sampled opener.
+    Both are copied, never mutated: a paired arena match hands the same start to
+    both colours.
     """
     if book is not None:
         g = book_opening(book, seed)
     elif opening is not None:
-        g = copy.copy(opening)
+        # A real copy: Game.copy duplicates the board and the move list, while a
+        # shallow copy would hand the caller's position back mutated.
+        g = opening.copy()
     else:
-        g = balanced_opening(rule, seed, opening_plies)
-    # Reset after the opening so the exploration stream depends on the seed
-    # alone, not on how many moves the opening happened to consume.
+        g = balanced_opening(cfg["rule"], seed, cfg.get("opening_plies", 8))
     rng = np.random.default_rng(seed)
-    tree = MCTS(evaluator, simulations, cpuct, rng)
-    samples = []
-    opening = opening_moves(g)
-    moves = list(opening)
-    search_stats = []
+    tree = MCTS(evaluator, cfg["simulations"], cfg.get("cpuct", 2.0), rng,
+                **search_options(cfg))
+    opening_played = opening_moves(g)
+    moves = list(opening_played)
+    per_move, search_stats = [], []
     while g.adjudicate() is None:
-        pi = tree.policy(g, noise=True, stop=stop)
-        search_stats.append(tree.last_stats)
-        samples.append((g.encode().astype(np.uint8), pi.astype(np.float16), g.player))
-        probabilities = pi.astype(np.float64)
-        probabilities /= probabilities.sum()
-        a = int(rng.choice(225, p=probabilities)) if len(moves) < temperature_moves else int(np.argmax(pi))
-        g.move(a, validate=False)
-        tree.advance(a, g)
-        moves.append(a)
-    return [(x, p, float(player*g.winner)) for x, p, player in samples], {
-        "winner": g.winner, "moves": moves, "simulations": tree.completed,
-        "opening": opening,
-        "candidate_count_mean": float(np.mean([s["candidate_count"] for s in search_stats])),
-        "forced_win_count": sum(s["forced_win"] for s in search_stats),
-        "forced_defense_count": sum(s["forced_defense"] for s in search_stats),
-        "strategic_count": sum(s["strategic"] for s in search_stats),
-        "search_max_depth": max(s["max_depth"] for s in search_stats),
-        "search_prior_kl_mean": float(np.mean([s["search_prior_kl"] for s in search_stats])),
-        "value_abs_mean": float(np.mean([s["value_abs_mean"] for s in search_stats]))}
+        budget, full = search_plan(cfg, rng)
+        result = tree.search(g, noise=full, budget=budget, full_search=full, stop=stop)
+        forced = result.stats["candidate_count"] <= 1
+        valid = (full or float(cfg.get("cheap_search_target_weight", 0.0)) > 0) and not forced
+        per_move.append({
+            "state": g.encode().astype(np.uint8),
+            "policy": result.policy if valid else np.zeros(225, np.float32),
+            "policy_valid": 1 if valid else 0,
+            "policy_weight": 1.0 if full else float(cfg.get("cheap_search_target_weight", 0.0)),
+            "search_value": result.value,
+            "q_spread": result.q_spread,
+            "policy_surprise": result.stats["policy_surprise"],
+            "value_surprise": result.stats["value_surprise"],
+            # The budget this move was given, not the resulting visit count:
+            # subtree reuse carries the parent one visit over, and the record
+            # should say how much search the move was actually worth.
+            "simulations": budget,
+            "full_search": 1 if full else 0,
+        })
+        search_stats.append(result.stats)
+        visits = np.asarray(result.visits, np.float64)
+        if visits.sum() <= 0:
+            action = int(np.argmax(result.policy if result.policy.any() else g.legal()))
+        elif len(moves) < int(cfg.get("temperature_moves", 20)):
+            probabilities = visits / visits.sum()
+            action = int(rng.choice(225, p=probabilities))
+        else:
+            action = int(np.argmax(visits))
+        g.move(action, validate=False)
+        tree.advance(action, g)
+        moves.append(action)
+    records, horizon = _records(cfg, per_move, search_stats, g, opening_played, moves,
+                                int(game_id))
+    return records, _game_stats(per_move, search_stats, g, opening_played, moves, tree, horizon)
+
+
+def _records(cfg, per_move, search_stats, game, opening_played, moves, game_id):
+    """The finished game as one explicitly named record batch."""
+    plies = len(per_move)
+    horizons = value_horizons(cfg)
+    search_values = np.array([move["search_value"] for move in per_move], np.float64)
+    values, valid, horizon_stats = value_targets(search_values, game.winner,
+                                                 horizons["short"], horizons["mid"])
+    records = blank(plies)
+    for index, move in enumerate(per_move):
+        records["state"][index] = move["state"]
+        records["policy"][index] = move["policy"]
+        records["policy_valid"][index] = move["policy_valid"]
+        records["policy_weight"][index] = move["policy_weight"]
+        records["search_value"][index] = move["search_value"]
+        records["q_spread"][index] = move["q_spread"]
+        records["policy_surprise"][index] = move["policy_surprise"]
+        records["value_surprise"][index] = move["value_surprise"]
+        records["simulations"][index] = move["simulations"]
+        records["full_search"][index] = move["full_search"]
+        records["game_id"][index] = game_id
+        records["ply"][index] = index
+        records["winner"][index] = game.winner
+        records["source"][index] = SOURCE_SELFPLAY
+    records["value"] = values
+    records["value_valid"] = valid
+    records["weight"] = surprise_weights(records["policy_surprise"],
+                                         records["value_surprise"], cfg)
+    return records, horizon_stats
+
+
+def _game_stats(per_move, search_stats, game, opening_played, moves, tree, horizon):
+    def mean(key, source=search_stats):
+        values = [item[key] for item in source]
+        return float(np.mean(values)) if values else 0.0
+    full = [move["full_search"] for move in per_move]
+    return {
+        "winner": game.winner, "moves": moves, "simulations": tree.completed,
+        "opening": [int(action) for action in opening_played],
+        "candidate_count_mean": mean("candidate_count"),
+        "forced_win_count": sum(item["forced_win"] for item in search_stats),
+        "forced_defense_count": sum(item["forced_defense"] for item in search_stats),
+        "bias_moves_mean": mean("bias_moves"),
+        "search_max_depth": max((item["max_depth"] for item in search_stats), default=0),
+        "search_prior_kl_mean": mean("search_prior_kl"),
+        "q_spread_mean": mean("q_spread"),
+        "root_value_mean": mean("root_value"),
+        "value_abs_mean": mean("value_abs_mean"),
+        "cheap_search_share": float(1.0 - np.mean(full)) if full else 0.0,
+        "policy_valid_share": float(np.mean([move["policy_valid"] for move in per_move]))
+        if per_move else 0.0,
+        "policy_surprise_mean": mean("policy_surprise"),
+        "value_surprise_mean": mean("value_surprise"),
+        # How often a horizon target had to bootstrap the search value instead
+        # of reading the true result: near zero means the horizon is too long
+        # for this game length to teach anything the final head does not.
+        "horizon_bootstrap_share": float((horizon["short_bootstrap"]
+                                          + horizon["mid_bootstrap"])
+                                         / max(1, 2 * horizon["rows"])),
+    }
 
 
 def _actor(worker, tasks, requests, response, results, cancel, cfg):
@@ -63,10 +165,12 @@ def _actor(worker, tasks, requests, response, results, cancel, cfg):
             requests.put((worker, state))
             while not cancel.is_set():
                 try:
-                    return response.get(timeout=0.2)
+                    policy, value = response.get(timeout=0.2)
+                    return Inference.leaf_value(policy, value)
                 except queue.Empty:
                     pass
             raise SearchStopped()
+
         # A book is passed by path, never as an object: actors are spawned
         # processes, so a loaded dict would not survive the trip.
         book = None
@@ -80,10 +184,9 @@ def _actor(worker, tasks, requests, response, results, cancel, cfg):
             if seed is None:
                 return
             try:
-                data, stats = play_game(cfg["rule"], evaluate, cfg["simulations"], seed,
-                                        cancel.is_set, cfg["cpuct"], cfg["temperature_moves"],
-                                        cfg.get("opening_plies", 8), book=book)
-                results.put(("game", data, stats))
+                records, stats = play_game(cfg, evaluate, seed, cancel.is_set, book=book,
+                                           game_id=int(seed))
+                results.put(("game", records, stats))
             except SearchStopped:
                 return
     except BaseException:
@@ -103,8 +206,8 @@ def collect(cfg, evaluator, seeds, deadline, stop=lambda: False):
         tasks.put(None)
     actors = [ctx.Process(target=_actor, args=(i, tasks, requests, replies[i], results, cancel, cfg))
               for i in range(len(replies))]
-    samples, games = [], []
-    inference_positions, batches, largest_batch = 0, 0, 0
+    batches, games = [], []
+    inference_positions, batch_count, largest_batch = 0, 0, 0
     started = last_report = time.monotonic()
     cancelled_at = None
 
@@ -116,7 +219,7 @@ def collect(cfg, evaluator, seeds, deadline, stop=lambda: False):
                 break
             if kind == "error":
                 raise RuntimeError(data)
-            samples.extend(data)
+            batches.append(data)
             games.append(stats)
 
     try:
@@ -146,11 +249,11 @@ def collect(cfg, evaluator, seeds, deadline, stop=lambda: False):
                     break
             if cancel.is_set():
                 continue
-            logits, values = evaluator.batch([state for _, state in batch])
-            for (worker, _), p, v in zip(batch, logits, values):
+            inference = evaluator.batch([state for _, state in batch])
+            for (worker, _), p, v in zip(batch, inference.policy, inference.leaf()):
                 replies[worker].put((p, float(v)))
             inference_positions += len(batch)
-            batches += 1
+            batch_count += 1
             largest_batch = max(largest_batch, len(batch))
         drain()
         for actor in actors:
@@ -167,7 +270,8 @@ def collect(cfg, evaluator, seeds, deadline, stop=lambda: False):
         for q in [tasks, requests, results, *replies]:
             q.cancel_join_thread()
             q.close()
-    return samples, games, {"inference_positions": inference_positions, "batches": batches,
-                             "average_inference_batch_size": inference_positions/batches if batches else 0,
-                             "largest_inference_batch_size": largest_batch,
-                             "seconds": time.monotonic()-started}
+    records = np.concatenate(batches) if batches else blank(0)
+    return records, games, {"inference_positions": inference_positions, "batches": batch_count,
+                            "average_inference_batch_size": inference_positions/batch_count if batch_count else 0,
+                            "largest_inference_batch_size": largest_batch,
+                            "seconds": time.monotonic()-started}

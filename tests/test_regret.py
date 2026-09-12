@@ -28,7 +28,7 @@ from vk.datasets import FORMAT_VERSION, ShardWriter
 from vk.candidates import forced_candidates
 from vk.game import Game
 from vk.network import Evaluator, Network, architecture_of
-from vk.training import atomic_save
+from vk.storage import atomic_save, load_model_state
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "artifacts" / "diag_teacher_regret.py"
@@ -85,21 +85,26 @@ def fake_engine(path, start):
 
 
 def make_dataset(root, topk_actions, best):
-    writer = ShardWriter(root, shard_size=4)
-    slots = np.full(5, 255, np.uint8)
-    winrates = np.full(5, np.nan, np.float16)
+    """A one-row teacher shard, written by hand in the pre-refactor field set.
+
+    The reader normalises it onto the current schema, which is exactly the path
+    every dataset generated before the refactor takes.
+    """
+    (root / "test").mkdir(parents=True, exist_ok=True)
+    slots = np.full((1, 5), 255, np.uint8)
+    winrates = np.full((1, 5), np.nan, np.float16)
     for slot, action in enumerate(topk_actions[:5]):
-        slots[slot], winrates[slot] = np.uint8(action), np.float16(0.4)
-    state = np.zeros((3, 15, 15), np.uint8)
-    state[2] = 1                                   # Black to move
-    writer.add("test", {"state": state, "policy": np.full(225, 1 / 225, np.float16),
-                        "value": np.float16(0.0), "game_id": np.uint32(9),
-                        "ply": np.uint16(1), "teacher_best": np.uint16(best),
-                        "teacher_nodes": np.uint64(11),
-                        "teacher_topk_actions": slots, "teacher_topk_winrates": winrates})
-    writer.close()
+        slots[0, slot], winrates[0, slot] = np.uint8(action), np.float16(0.4)
+    state = np.zeros((1, 3, 15, 15), np.uint8)
+    state[:, 2] = 1                                # Black to move
+    np.savez_compressed(root / "test" / "shard-00000.npz", state=state,
+                        policy=np.full((1, 225), 1 / 225, np.float16),
+                        value=np.float16([0.0]), game_id=np.uint32([9]),
+                        ply=np.uint16([1]), teacher_best=np.uint16([best]),
+                        teacher_nodes=np.uint64([11]),
+                        teacher_topk_actions=slots, teacher_topk_winrates=winrates)
     (root / "manifest.json").write_text(
-        json.dumps({"format_version": FORMAT_VERSION, "rule": "freestyle"}), encoding="utf-8")
+        json.dumps({"format_version": 3, "rule": "freestyle"}), encoding="utf-8")
 
 
 def make_checkpoint(path, seed=0):
@@ -117,12 +122,12 @@ def deterministic_pick(checkpoint):
     read it instead of guessing: the engine's window and the shard's recorded
     top-5 are then built around the move that is actually played.
     """
-    state = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    state = load_model_state(checkpoint, "freestyle")
     model = Network(architecture_of(state["config"]))
     model.load_state_dict(state["model"])
     model.eval()
     game = Game("freestyle", player=1)
-    logits, _ = Evaluator(model, "cpu")(game.encode())
+    logits = Evaluator(model, "cpu")(game.encode()).policy
     allowed = forced_candidates(game).mask
     return int(np.argmax(np.where(allowed, logits, -np.inf)))
 
@@ -132,9 +137,9 @@ def run(tmp_path, dataset, checkpoint, engine, output, extra=()):
         [sys.executable, str(SCRIPT), "--dataset", str(dataset), "--checkpoint", str(checkpoint),
          "--engine", str(engine), "--engine-dir", str(tmp_path), "--split", "test",
          "--limit", "1", "--progress-every", "0", "--device", "cpu",
-         # On an empty board the tactical mode offers only the centre, so the
-         # model's move is the centre rather than an arbitrary empty point.
-         "--candidates", "tactical",
+         # On an empty board Renju forces the centre and freestyle biases it,
+         # so the model's move is the centre rather than an arbitrary point.
+         "--hard-rules", "forced",
          "--max-nodes", "10", "--threads", "1", "--hash-mb", "8", "--timeout", "5",
          "--output", str(output), "--cache", str(tmp_path / "cache.json"), *extra],
         capture_output=True, text=True, timeout=900)

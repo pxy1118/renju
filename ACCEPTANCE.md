@@ -758,5 +758,108 @@ A 更省的行 = 219   B 更省的行 = 227   持平 = 1054
 - **`top1` 验收门槛**：29% 的局面里记录的 `teacher_best` 与新鲜引擎 Top-1 不同，而门槛仍是 ≥45%（两个新模型只有 40–41%），可能需要改成「Top-1∈Top-2」之类的稳健版本。
 - **执白能力**：随机开局下执白 2-23、均势开局下执白 0-25——规则结构之外，模型在劣势侧确实没有翻盘手段。
 
+## 训练系统重构：多尺度 Value、PCR、软候选与显式数据 schema（2026-09-12）
+
+本节记录一次**架构级**重构，而不是又一次调参：把训练系统从「Rapfi 模仿 + 标准 AlphaZero」改为 KataGo 式的闭环，同时保持主干 `hybrid-128-10` 不变。改动的判据是「结构是否清晰 + 信号是否可观测」，棋力结论仍按第四/五节的纪律**不由本轮给出**。
+
+### 一、模块边界（新增 7 个，消除 4 处职责重叠）
+
+| 新模块 | 职责 |
+|---|---|
+| `vk/config.py` | 全部配置键、默认值、范围校验、resume 兼容集合、旧配置键映射 |
+| `vk/records.py` | position schema v4 唯一真源、D4 增广、v2/v3 读取归一化 |
+| `vk/targets.py` | 纯 numpy 目标构造：visit 剪枝、Dirichlet 去噪、soft policy、多尺度 n-step value、surprise 权重 |
+| `vk/replay.py` | 结构化数组回放、surprise 加权采样、checkpoint 序列化 |
+| `vk/objective.py` | 训练与预训练共用的损失、权重与掩码 |
+| `vk/storage.py` | 检查点与 jsonl、format-1 升级、`load_model_state` |
+| `vk/diagnostics.py` | 饱和 / 熵 / KL / Q 扩散 / 回合报告 |
+
+`training.py` 不再同时负责 IO、损失与轮循环；`pretraining.py` 不再自带一份硬编码配置和一份重复的 loss；`candidates.py` 的 `candidate_mask` / `tactical_candidates` 被 `hard_candidates` + `tactical_bias` 取代；`selfplay` 不再产出 `(x, pi, z)` 元组。`vk/game.py`、`vk/rapfi.py`、`vk/openings.py` 未改。
+
+### 二、训练信号的六处实质变化
+
+1. **多时间尺度 value**：三个 head `final` / `mid` / `short`。`final` 读终局结果；`mid` / `short` 在 10 / 4 手地平线处截断，未终局则用该局面自己的 `search_value` bootstrap（奇数手符号翻转）。地平线取值依据 freestyle 手数中位数 ≈27、残局 ≤20 手：20 手会退化成 final。
+2. **策略目标先去噪再剪枝**：先扣掉 Dirichlet 探索的期望访问量，再丢掉 `n < max(2, 0.02·max n)` 的子节点，最后归一化；loss 另加 `T=2` 的软目标项（权重 0.25）。
+3. **Playout Cap Randomization**：`cheap_search_prob=0.75`，full=400 / cheap=64（cheap 不会超过 full）。只有 full 着法监督策略头，cheap 着法只产 value 数据；硬规则只剩一个候选点的着法跑 1 次模拟并标为无策略监督。
+4. **Surprise 采样**：`w = (1-u) + u·clip(s/ref, 0, cap)`，默认 `u=0.5`、`cap=5.0`；既保留均匀下限，也封住异常样本。报告里的权重按均值 1 归一后再写出。
+5. **候选机制解耦**：`hard_rules` 只覆盖成五/必挡这类确定性情形；成四威胁与邻域变成加在 logits 上的偏置（+2.0 / +0.5），**任何合法着法都不再被永久排除**。
+6. **统一目标与配置**：`policy_weight`、三个 `value_weight_*`、`policy_soft_*`、采样参数全部只写在 `vk/config.py`；训练与预训练调用 `vk.objective.compute_loss`。某个 head 在本批没有有效行时**不贡献梯度**。
+
+### 三、验证（全部实测）
+
+| 项目 | 结果 |
+|---|---|
+| 单元测试 | **264 passed, 1 skipped**（重构前 182 passed / 1 skipped，60 秒） |
+| 主干参数 | trunk+policy **2,788,413 逐位不变**，总参数 2,813,376（= +2×8,321 个新 head） |
+| `doctor` | `value_heads=["final","mid","short"]` |
+| smoke（freestyle / renju，hybrid-8-1） | 各 2 局、2 步更新，全部指标齐全 |
+| 旧检查点互操作 | `--init-checkpoint runs/freestyle-pretrain/best.pt`（format 1）成功冷启动；format-1 **续训**被明确拒绝并提示改用 `--init-checkpoint` |
+| 旧数据互操作 | v2/v3 教师数据无需重新生成，读取时归一化（`source=2`、地平线 head 无效） |
+
+hybrid-128-10 实跑（`artifacts/refactor-hybrid`，GPU，185 秒，2 轮 / 128 局 / 200 步，由 format-1 教师权重初始化）：
+
+| 指标 | 第 1 轮 | 第 2 轮 |
+|---|---:|---:|
+| 对局 / 更新 | 64 / 100 | 64 / 100 |
+| 执黑 / 执白 | 96.9% / 3.1% | 96.9% / 3.1% |
+| full / cheap 占比 | 0.27 / 0.73 | 0.27 / 0.73 |
+| policy 有效行占比 | 0.23 | 0.23 |
+| `q_spread_mean` | 0.064 | 0.064 |
+| `kl_target_prior`（搜索比先验多出的信息） | 0.238 | 0.238 |
+| `kl_target_network` | 0.152 | 0.152 |
+| 策略目标熵 / 网络熵 | 1.32 / 1.32 | 1.32 / 1.32 |
+| `horizon_bootstrap_share` | 0.302 | 0.302 |
+| 采样权重 max（cap=5 生效后） | 3.0 | 3.0 |
+| 完成对局模拟数/秒 | 1046.8 | 1046.8 |
+
+**value 饱和在本轮数据上没有被消除，而且原因是已知的**：三个 head 在这批对局里的 `mean|v|` 分别是 1.000 / 0.999 / 0.992（`|v|>0.9` 占 100% / 99.8% / 98.6%）。这不是网络问题，而是第九节已经量过的规则结构：随机平衡开局压不住先手，这一轮 96.9% 是黑胜，于是**任何地平线都通向同一个结果**。反证在同一批 smoke 数据里：hybrid-8-1 的 `mid` / `short` 目标 `mean|v|` = 0.26 / 0.14（`|v|<0.5` 占 77% / 89%），说明地平线标签在真正有悬念的局面里确实不饱和。结论：**多尺度 value 只在开局分布本身均衡时才有用**，与第七/九节的判断一致，本轮不把它当作棋力提升的证据。
+
+**搜索确实产出了比 visit 分布更干净的目标**：策略目标熵 1.32（不是 one-hot），400 次模拟下 `root_visited_moves` 61.9、`root_max_visit_share` 0.53、`q_spread_mean` 0.232（评测局面）。对齐第五节的诊断（当时 `|V|`≈0.976、实际只展开约 3 个着法、PUCT 退化回先验）：**这次 Q 项不再是常数**，但「不是常数」不等于「更强」，见下。
+
+### 四、search-vs-policy：判据就位，结论待跑
+
+新增 `--opponent self-policy`：同一个 checkpoint、同一批平衡开局、交换执色，一侧用 MCTS、一侧用裸策略，报告 `search_advantage_pp` 与其配对区间。3 对（6 局）的冒烟结果：
+
+```
+score 0.833（5 胜 1 负）  advantage +66.7 pp  CI95 [-90.2, +100]
+```
+
+**这个区间说明不了任何事**（n=3）。按第四/五节定下的纪律，本轮只声明「测量已就位、口径与旧臂一致」，**不声明搜索变强了**。要把区间收到 ±5pp 以内需要约 100 开局对，属于下一轮的预算决策。
+
+### 五、兼容面（只保留两处，且各集中在一个函数）
+
+1. `vk/storage.upgrade_format1()`：format-1 → format 2。旧的单个 value head 原样成为 final head，`mid` / `short` 由它初始化；旧回放池（无 schema 的元组列表）直接丢弃。因此 **format-1 可推理、可初始化，不可续训**。
+2. `vk/records.normalize_legacy()`：教师 v2/v3 → v4。旧 `value` 同时作为 final head 与 `search_value`，地平线 head 标为无效、`source=2`（旧文件从未记录局面结果），磁盘数据不重写。
+
+配置侧的旧键 `candidates` 只在 `vk/config.LEGACY_CANDIDATE_MODES` 映射一次（`tactical→(forced,tactical)`、`forced→(forced,none)`、`legal→(none,none)`）；命令行 `--candidate-mode` 已被 `--hard-rules` / `--search-bias` 取代。
+
+### 六、下一轮的预登记问题
+
+1. `cheap_search_prob=0` 对照：PCR 是否在同等算力下提高 value 数据量而不损害对局质量（判据：晋升赛胜率 + 每轮 `q_spread_mean`）。
+2. `search_value_mix` final-only 对照：把 mid 混进叶值到底帮助还是污染 Q。
+3. 均衡开局（`--opening-mode book`）下的多尺度 value 饱和：若 `|v|` 仍在 0.9 以上，则本方向可以判掉，与第九节同口径。
+4. `evaluate --opponent self-policy --pairs 100`：把 search-vs-policy 的区间收到 ±5pp 以内再做结论。
 
 
+
+
+
+## 分享的观战链接（只读，2026-09-11 追加）
+
+需求：`--public`（以及 `--share`）分享后，除了邀请链接还应有一条**观战链接**——让拿不到（或不该拿到）落子权的人也能看到正在进行的对局。
+
+### 设计
+
+- **观战是独立凭据，不占棋桌**。`make_server` 在 `join_key` 之外再生成一把 `watch_key`；`/watch?w=<key>` 首次打开按邀请链接同款流程换成 `renju_watch` Cookie（`HttpOnly`、`SameSite=Strict`），密钥只在地址栏停留一次。观战串与邀请串互不通用：拿 `k` 开不了观战页，拿 `w` 也开不出棋桌（用例双向断言）。
+- **只读是结构性的**。观战页只 GET `/api/watch`；观战浏览器没有会话 Cookie、也拿不到 `/api/config` 里的 CSRF 令牌，`admit()` 对所有落子路由照旧拒绝。因此“看到对局 id”也落不了子（用例直接拿 feed 里的 id 试落子，期望 403）。
+- **看什么**：`/api/watch` 返回所有**已开局**的桌子（按桌号排序）的完整快照，观战页提供“选择对局”下拉、棋盘（复用抽出的 `board.js` 渲染，不绑落子事件）、手数、思考中/终局状态、模型信息与落子记录；选中的桌离开后自动回落到第一局。轮询节奏与对弈页一致（思考中 250 ms、空闲 1 s）。
+- **前端抽公共件**：`vk/web/board.js` 承载棋盘构建、落子高亮与获胜连线判定，对弈页与观战页共用；`index.html` 的“邀请棋友”面板改名“邀请与观战”，新增观战链接行与复制按钮，`/api/config` 新增 `watch` 字段（隧道访客按请求来源生成 `/watch?w=…`，局域网访客仍是启动打印的地址）。
+- **静态资源共享边界**：`/style.css` 与 `/board.js` 两个文件接受任一凭据（观战 Cookie 或会话 Cookie），因为观战者与对弈者各只持其一；`/watch`、`/watch.js`、`/api/watch` 只认观战凭据。未开分享的服务这三条路由仍是 404。
+- **顺手修了一个既有的视觉缺陷**：复制按钮用的 `.secondary` 带 `width:100%`，在 `.invite` flex 行里会吃掉整行宽度，把链接输入框挤成 22px 的缝——旧面板的邀请链接框一直如此（此前的验证只有 dump-dom，量不出布局）。现加 `.share-panel .invite button{width:auto}`，输入框恢复 `flex:1` 铺满（实测 22px → 1286px），观战链接行同款受益。
+- **启动日志**：`--share` 可达时打印 `观战链接（只读，不占棋桌）`；`--public` 在口令与邀请链接之外打印 `公网观战链接: https://<域名>/watch?w=<串>`，并把提示语改为“邀请链接和口令发给对弈的人，观战链接发给只看不下的人”。
+
+### 验证
+
+`tests/test_webui.py` 由 22 项增至 **24 项**（新增 `test_watch_link_mirrors_games_and_never_plays`、`test_watch_routes_need_a_shared_server`；代理 Host 用例补齐观战链接按来源生成；`serve` 用例断言公网横幅同时打印两条链接）。全量套件 **267 passed, 1 skipped**（改前 265）。
+
+实机复验（`artifacts/verification/watch-live.py`，真实服务 + headless Chrome）：0.0.0.0 共享实例上嘉宾经邀请链接开局、落子 H8，模型应手 D4；观战页 dump-dom 显示“桌 1 · 自由五子棋 · 第 2 手”、黑子已上盘、模型信息与落子记录齐全；对弈页“邀请与观战”面板给出可复制的观战链接。截图见 `artifacts/verification/watch-page.png`。
